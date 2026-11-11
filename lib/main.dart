@@ -998,7 +998,7 @@ class _ChapterPageState extends State<ChapterPage> {
                 left: 16,
                 bottom: 16,
                 child: Container(
-                  width: 220,
+                  width: 150,
                   height: 48,
                   decoration: BoxDecoration(
                     color: Colors.white,
