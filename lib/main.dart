@@ -1,8 +1,11 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -51,6 +54,8 @@ class VocabularyApp extends StatelessWidget {
   }
 }
 
+// ───────────────────────── Data models ─────────────────────────
+
 class WordEntry {
   WordEntry({required this.word, required this.meanings});
   final String word;
@@ -96,14 +101,23 @@ class BookData {
 
 enum WordState { unknown, known, showAgain }
 
+// ───────────────────────── Store ─────────────────────────
+
 class BookStore extends ChangeNotifier {
   late SharedPreferences _prefs;
   final List<BookData> books = [];
-  
-  final Map<String, Map<String, WordState>> _wordStates = {};
+
+  /// Global word states (shared by all books). Stored in known_words.json.
+  final Set<String> _known = {};
+  final Set<String> _showAgain = {};
+
+  final Map<String, Set<String>> _uniqueCache = {};
+  Future<void> _saveChain = Future.value();
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
+    await _loadKnownWords();
+
     final directory = await _booksDirectory();
     final saved = _prefs.getStringList('book_records') ?? [];
 
@@ -124,25 +138,150 @@ class BookStore extends ChangeNotifier {
           parts: parts,
           jsonPath: path,
         ));
-        
-        final stateMap = <String, WordState>{};
-        final storedStates = _prefs.getStringList('states_$id') ?? [];
-        for (final entryStr in storedStates) {
-          final partsList = entryStr.split(':');
-          if (partsList.length == 2) {
-            final w = partsList[0];
-            final stateName = partsList[1];
-            if (stateName == 'known') {
-              stateMap[w] = WordState.known;
-            } else if (stateName == 'showAgain') {
-              stateMap[w] = WordState.showAgain;
-            }
-          }
-        }
-        _wordStates[id] = stateMap;
       } catch (_) {}
     }
   }
+
+  // ── Known words file ──
+
+  Future<File> _knownFile() async {
+    final root = await getApplicationDocumentsDirectory();
+    return File('${root.path}/known_words.json');
+  }
+
+  Future<void> _loadKnownWords() async {
+    final file = await _knownFile();
+    if (await file.exists()) {
+      try {
+        _mergeJson(jsonDecode(await file.readAsString()));
+        return;
+      } catch (_) {
+        _known.clear();
+        _showAgain.clear();
+      }
+    }
+    await _migrateFromPrefs();
+  }
+
+  /// One-time migration of the old per-book states into the global file.
+  Future<void> _migrateFromPrefs() async {
+    final saved = _prefs.getStringList('book_records') ?? [];
+    for (final record in saved) {
+      try {
+        final map = jsonDecode(record) as Map<String, dynamic>;
+        final id = map['id'] as String;
+        final states = _prefs.getStringList('states_$id') ?? [];
+        for (final entry in states) {
+          final idx = entry.lastIndexOf(':');
+          if (idx <= 0) continue;
+          final w = normalizeWord(entry.substring(0, idx));
+          final s = entry.substring(idx + 1);
+          if (w.isEmpty) continue;
+          if (s == 'known') {
+            _known.add(w);
+          } else if (s == 'showAgain') {
+            _showAgain.add(w);
+          }
+        }
+      } catch (_) {}
+    }
+    _showAgain.removeAll(_known);
+    await _writeNow();
+  }
+
+  /// Merges a decoded known_words.json into memory. Known wins over showAgain.
+  /// Returns how many words became newly known.
+  int _mergeJson(dynamic decoded) {
+    List<dynamic> knownList = const [];
+    List<dynamic> againList = const [];
+
+    if (decoded is List) {
+      knownList = decoded;
+    } else if (decoded is Map) {
+      final k = decoded['known'];
+      final a = decoded['showAgain'] ?? decoded['show_again'];
+      if (k is! List && a is! List) {
+        throw const FormatException(
+            'This file has no "known" or "showAgain" list.');
+      }
+      if (k is List) knownList = k;
+      if (a is List) againList = a;
+    } else {
+      throw const FormatException('Unrecognised known words file.');
+    }
+
+    final before = _known.length;
+    for (final item in knownList) {
+      final w = normalizeWord(item.toString());
+      if (w.isEmpty) continue;
+      _known.add(w);
+      _showAgain.remove(w);
+    }
+    for (final item in againList) {
+      final w = normalizeWord(item.toString());
+      if (w.isEmpty || _known.contains(w)) continue;
+      _showAgain.add(w);
+    }
+    return _known.length - before;
+  }
+
+  String _encode() {
+    final known = _known.toList()..sort();
+    final again = _showAgain.toList()..sort();
+    return const JsonEncoder.withIndent('  ').convert({
+      'version': 1,
+      'known': known,
+      'showAgain': again,
+    });
+  }
+
+  Future<void> _writeNow() async {
+    final file = await _knownFile();
+    await file.writeAsString(_encode(), flush: true);
+  }
+
+  Future<void> _saveKnownWords() {
+    _saveChain = _saveChain.then((_) => _writeNow()).catchError((_) {});
+    return _saveChain;
+  }
+
+  /// Lets the user save known_words.json anywhere. Returns the path or null.
+  Future<String?> exportKnownWords() async {
+    final bytes = Uint8List.fromList(utf8.encode(_encode()));
+    final path = await FilePicker.platform.saveFile(
+      dialogTitle: 'Export known words',
+      fileName: 'known_words.json',
+      type: FileType.custom,
+      allowedExtensions: ['json'],
+      bytes: bytes,
+    );
+    if (path == null) return null;
+    if (!(Platform.isAndroid || Platform.isIOS)) {
+      await File(path).writeAsBytes(bytes);
+    }
+    return path;
+  }
+
+  /// Picks a known_words.json and merges it. Returns newly known count, or null if cancelled.
+  Future<int?> importKnownWords() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['json'],
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return null;
+    final bytes = result.files.single.bytes;
+    if (bytes == null) {
+      throw Exception('Could not read the selected file.');
+    }
+    final decoded = jsonDecode(utf8.decode(bytes));
+    final added = _mergeJson(decoded);
+    notifyListeners();
+    await _saveKnownWords();
+    return added;
+  }
+
+  // ── Books ──
 
   Future<Directory> _booksDirectory() async {
     final root = await getApplicationDocumentsDirectory();
@@ -153,66 +292,79 @@ class BookStore extends ChangeNotifier {
 
   static String normalizeWord(String word) => word.trim().toLowerCase();
 
-  WordState getWordState(String bookId, String word) {
-    return _wordStates[bookId]?[normalizeWord(word)] ?? WordState.unknown;
+  WordState getWordState(String word) {
+    final key = normalizeWord(word);
+    if (_known.contains(key)) return WordState.known;
+    if (_showAgain.contains(key)) return WordState.showAgain;
+    return WordState.unknown;
   }
 
-  int knownCount(String bookId) {
-    final map = _wordStates[bookId];
-    if (map == null) return 0;
-    return map.values.where((s) => s == WordState.known).length;
+  Set<String> uniqueWords(BookData book) {
+    return _uniqueCache.putIfAbsent(book.id, () {
+      final all = <String>{};
+      for (final part in book.parts) {
+        for (final chapter in part.chapters) {
+          for (final entry in chapter.words) {
+            all.add(normalizeWord(entry.word));
+          }
+        }
+      }
+      return all;
+    });
   }
 
-  int totalUniqueWords(BookData book) {
-    final all = <String>{};
+  int totalUniqueWords(BookData book) => uniqueWords(book).length;
+
+  int knownCount(BookData book) =>
+      uniqueWords(book).where(_known.contains).length;
+
+  /// Distinct words of a book that are not known (unknown + showAgain).
+  List<WordEntry> practiceWords(BookData book) {
+    final byKey = <String, WordEntry>{};
     for (final part in book.parts) {
       for (final chapter in part.chapters) {
         for (final entry in chapter.words) {
-          all.add(normalizeWord(entry.word));
+          final key = normalizeWord(entry.word);
+          if (_known.contains(key)) continue;
+          final existing = byKey[key];
+          if (existing == null) {
+            byKey[key] = WordEntry(
+              word: entry.word,
+              meanings: List<String>.from(entry.meanings),
+            );
+          } else {
+            for (final m in entry.meanings) {
+              if (!existing.meanings.contains(m)) existing.meanings.add(m);
+            }
+          }
         }
       }
     }
-    return all.length;
+    return byKey.values.toList();
   }
 
-  Future<void> setWordState(String bookId, String word, WordState newState) async {
-    final map = _wordStates.putIfAbsent(bookId, () => <String, WordState>{});
+  Future<void> setWordState(String word, WordState newState) async {
     final key = normalizeWord(word);
-    
-    if (newState == WordState.unknown) {
-      map.remove(key);
-    } else {
-      map[key] = newState;
+    if (key.isEmpty) return;
+    _known.remove(key);
+    _showAgain.remove(key);
+    if (newState == WordState.known) {
+      _known.add(key);
+    } else if (newState == WordState.showAgain) {
+      _showAgain.add(key);
     }
-    await _saveStates(bookId);
     notifyListeners();
+    await _saveKnownWords();
   }
 
-  Future<void> markAllChapterKnown(String bookId, ChapterData chapter) async {
-    final map = _wordStates.putIfAbsent(bookId, () => <String, WordState>{});
+  Future<void> markAllChapterKnown(ChapterData chapter) async {
     for (final entry in chapter.words) {
       final key = normalizeWord(entry.word);
-      final currentState = map[key] ?? WordState.unknown;
-      
-      if (currentState != WordState.showAgain) {
-        map[key] = WordState.known;
-      }
+      if (_showAgain.contains(key)) continue; // Show Again is protected
+      _known.add(key);
     }
-    await _saveStates(bookId);
     notifyListeners();
-  }
-
-  Future<void> _saveStates(String bookId) async {
-    final map = _wordStates[bookId] ?? {};
-    final list = <String>[];
-    map.forEach((w, state) {
-      if (state == WordState.known) {
-        list.add('$w:known');
-      } else if (state == WordState.showAgain) {
-        list.add('$w:showAgain');
-      }
-    });
-    await _prefs.setStringList('states_$bookId', list);
+    await _saveKnownWords();
   }
 
   Future<String?> importBook() async {
@@ -252,8 +404,6 @@ class BookStore extends ChangeNotifier {
       jsonPath: path,
     );
     books.add(book);
-    _wordStates[id] = <String, WordState>{};
-    await _prefs.setStringList('states_$id', []);
     await _saveBookRecords();
     notifyListeners();
     return id;
@@ -261,7 +411,7 @@ class BookStore extends ChangeNotifier {
 
   Future<void> removeBook(BookData book) async {
     books.removeWhere((b) => b.id == book.id);
-    _wordStates.remove(book.id);
+    _uniqueCache.remove(book.id);
     final file = File(book.jsonPath);
     if (await file.exists()) await file.delete();
     await _prefs.remove('states_${book.id}');
@@ -270,14 +420,18 @@ class BookStore extends ChangeNotifier {
   }
 
   Future<void> _saveBookRecords() async {
-    final records = books.map((b) => jsonEncode({
-      'id': b.id,
-      'name': b.name,
-      'fileName': b.fileName,
-    })).toList();
+    final records = books
+        .map((b) => jsonEncode({
+              'id': b.id,
+              'name': b.name,
+              'fileName': b.fileName,
+            }))
+        .toList();
     await _prefs.setStringList('book_records', records);
   }
 }
+
+// ───────────────────────── JSON parser ─────────────────────────
 
 class JsonBookParser {
   static List<PartData> parseParts(dynamic root) {
@@ -289,7 +443,9 @@ class JsonBookParser {
         rootMap['structure'] ??
         rootMap['book_structure'];
 
-    if (rawParts is Map && rawParts.containsKey('parts') && rawParts['parts'] is Map) {
+    if (rawParts is Map &&
+        rawParts.containsKey('parts') &&
+        rawParts['parts'] is Map) {
       rawParts = rawParts['parts'];
     }
 
@@ -301,8 +457,13 @@ class JsonBookParser {
         if (partMap == null) continue;
 
         final partTitle = _firstText(partMap, [
-          'part_title', 'part_name', 'title', 'name', 'part'
-        ]) ?? 'Part ${p + 1}';
+              'part_title',
+              'part_name',
+              'title',
+              'name',
+              'part'
+            ]) ??
+            'Part ${p + 1}';
 
         final chapters = _parseChapters(partMap);
         result.add(PartData(
@@ -329,11 +490,12 @@ class JsonBookParser {
   }
 
   static List<ChapterData> _parseChapters(Map<String, dynamic> partMap) {
-    dynamic rawChapters = partMap['chapters'] ??
-        partMap['chapter_list'] ??
-        partMap['items'];
+    dynamic rawChapters =
+        partMap['chapters'] ?? partMap['chapter_list'] ?? partMap['items'];
 
-    if (rawChapters is Map && rawChapters.containsKey('chapters') && rawChapters['chapters'] is Map) {
+    if (rawChapters is Map &&
+        rawChapters.containsKey('chapters') &&
+        rawChapters['chapters'] is Map) {
       rawChapters = rawChapters['chapters'];
     }
 
@@ -345,8 +507,13 @@ class JsonBookParser {
         if (chapterMap == null) continue;
 
         final chapterTitle = _firstText(chapterMap, [
-          'chapter_title', 'chapter_name', 'title', 'name', 'chapter'
-        ]) ?? 'Chapter ${c + 1}';
+              'chapter_title',
+              'chapter_name',
+              'title',
+              'name',
+              'chapter'
+            ]) ??
+            'Chapter ${c + 1}';
 
         final words = _parseWords(chapterMap);
         chapters.add(ChapterData(
@@ -397,7 +564,9 @@ class JsonBookParser {
           final word = _firstText(map, ['word', 'english', 'en', 'term']);
           if (word != null) {
             final meanings = map['bangla_meanings'] ??
-                map['meanings'] ?? map['bn'] ?? map['meaning'];
+                map['meanings'] ??
+                map['bn'] ??
+                map['meaning'];
             add(word, meanings);
           }
         } else if (item is String) {
@@ -437,7 +606,8 @@ class JsonBookParser {
         }
       }
     }
-    entries.sort((a, b) => a.word.toLowerCase().compareTo(b.word.toLowerCase()));
+    entries
+        .sort((a, b) => a.word.toLowerCase().compareTo(b.word.toLowerCase()));
     return entries;
   }
 
@@ -512,18 +682,44 @@ class JsonBookParser {
   }
 }
 
+// ───────────────────────── Books page ─────────────────────────
+
 class BooksPage extends StatelessWidget {
   const BooksPage({super.key, required this.store});
   final BookStore store;
+
+  void _msg(BuildContext context, String text) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(text)));
+  }
 
   Future<void> _addBook(BuildContext context) async {
     try {
       await store.importBook();
     } catch (e) {
-      if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not import book: $e')),
-      );
+      _msg(context, 'Could not import book: $e');
+    }
+  }
+
+  Future<void> _exportKnown(BuildContext context) async {
+    try {
+      final path = await store.exportKnownWords();
+      if (path != null) _msg(context, 'Known words exported');
+    } catch (e) {
+      _msg(context, 'Export failed: $e');
+    }
+  }
+
+  Future<void> _importKnown(BuildContext context) async {
+    try {
+      final added = await store.importKnownWords();
+      if (added != null) {
+        _msg(context, 'Imported and merged • $added new known words');
+      }
+    } catch (e) {
+      _msg(context, 'Import failed: $e');
     }
   }
 
@@ -531,14 +727,41 @@ class BooksPage extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('My Books', style: TextStyle(fontWeight: FontWeight.w800)),
+        title: const Text('My Books',
+            style: TextStyle(fontWeight: FontWeight.w800)),
         actions: [
           IconButton(
             tooltip: 'Import a JSON book',
             onPressed: () => _addBook(context),
             icon: const Icon(Icons.add_circle_outline, size: 28),
           ),
-          const SizedBox(width: 8),
+          PopupMenuButton<String>(
+            tooltip: 'Known words',
+            icon: const Icon(Icons.more_vert),
+            onSelected: (value) {
+              if (value == 'export') _exportKnown(context);
+              if (value == 'import') _importKnown(context);
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(
+                value: 'export',
+                child: ListTile(
+                  leading: Icon(Icons.file_upload_outlined),
+                  title: Text('Export known words'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              PopupMenuItem(
+                value: 'import',
+                child: ListTile(
+                  leading: Icon(Icons.file_download_outlined),
+                  title: Text('Import known words'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(width: 4),
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
@@ -559,7 +782,7 @@ class BooksPage extends StatelessWidget {
                 for (final book in store.books)
                   Card(
                     child: ListTile(
-                      contentPadding: const EdgeInsets.all(16),
+                      contentPadding: const EdgeInsets.fromLTRB(16, 16, 8, 16),
                       leading: Container(
                         width: 52,
                         height: 58,
@@ -567,20 +790,41 @@ class BooksPage extends StatelessWidget {
                           color: const Color(0xFFE8F1EC),
                           borderRadius: BorderRadius.circular(12),
                         ),
-                        child: const Icon(Icons.menu_book_rounded, color: Color(0xFF356859), size: 30),
+                        child: const Icon(Icons.menu_book_rounded,
+                            color: Color(0xFF356859), size: 30),
                       ),
-                      title: Text(book.name, style: const TextStyle(fontWeight: FontWeight.w700)),
+                      title: Text(book.name,
+                          style: const TextStyle(fontWeight: FontWeight.w700)),
                       subtitle: Padding(
                         padding: const EdgeInsets.only(top: 6),
                         child: Text(
-                          '${book.parts.length} Parts  •  ${store.totalUniqueWords(book)} unique words\n${store.knownCount(book.id)} known',
+                          '${book.parts.length} Parts  •  ${store.totalUniqueWords(book)} unique words\n${store.knownCount(book)} known',
                         ),
                       ),
                       isThreeLine: true,
-                      trailing: const Icon(Icons.chevron_right),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            tooltip: 'Play word bubbles',
+                            icon: const Icon(Icons.play_circle_fill_rounded,
+                                size: 34, color: Color(0xFF356859)),
+                            onPressed: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) =>
+                                    GamePage(store: store, book: book),
+                              ),
+                            ),
+                          ),
+                          const Icon(Icons.chevron_right),
+                        ],
+                      ),
                       onTap: () => Navigator.push(
                         context,
-                        MaterialPageRoute(builder: (_) => PartsPage(store: store, book: book)),
+                        MaterialPageRoute(
+                            builder: (_) =>
+                                PartsPage(store: store, book: book)),
                       ),
                     ),
                   ),
@@ -596,27 +840,34 @@ class _EmptyState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Center(
-    child: Padding(
-      padding: const EdgeInsets.all(32),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.library_books_outlined, size: 76, color: Color(0xFF8AA99A)),
-          const SizedBox(height: 18),
-          const Text('Your library is empty', style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800)),
-          const SizedBox(height: 8),
-          const Text(
-            'Import a book JSON file. Each JSON will be stored as a separate book.',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.black54, height: 1.4),
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.library_books_outlined,
+                  size: 76, color: Color(0xFF8AA99A)),
+              const SizedBox(height: 18),
+              const Text('Your library is empty',
+                  style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 8),
+              const Text(
+                'Import a book JSON file. Each JSON will be stored as a separate book.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.black54, height: 1.4),
+              ),
+              const SizedBox(height: 20),
+              FilledButton.icon(
+                  onPressed: onAdd,
+                  icon: const Icon(Icons.upload_file),
+                  label: const Text('Import JSON')),
+            ],
           ),
-          const SizedBox(height: 20),
-          FilledButton.icon(onPressed: onAdd, icon: const Icon(Icons.upload_file), label: const Text('Import JSON')),
-        ],
-      ),
-    ),
-  );
+        ),
+      );
 }
+
+// ───────────────────────── Parts / Chapters ─────────────────────────
 
 class PartsPage extends StatelessWidget {
   const PartsPage({super.key, required this.store, required this.book});
@@ -625,71 +876,86 @@ class PartsPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: Text(book.name, style: const TextStyle(fontWeight: FontWeight.w800))),
-    body: ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        _BookProgress(store: store, book: book),
-        const SizedBox(height: 14),
-        for (var i = 0; i < book.parts.length; i++)
-          _FolderTile(
-            title: book.parts[i].title,
-            subtitle: [
-              '${book.parts[i].chapters.length} Chapters',
-              if (book.parts[i].pageRange.isNotEmpty) book.parts[i].pageRange,
-            ].join('  •  '),
-            icon: Icons.folder_rounded,
-            onTap: () => Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => ChaptersPage(store: store, book: book, part: book.parts[i]),
+        appBar: AppBar(
+            title: Text(book.name,
+                style: const TextStyle(fontWeight: FontWeight.w800))),
+        body: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            _BookProgress(store: store, book: book),
+            const SizedBox(height: 14),
+            for (var i = 0; i < book.parts.length; i++)
+              _FolderTile(
+                title: book.parts[i].title,
+                subtitle: [
+                  '${book.parts[i].chapters.length} Chapters',
+                  if (book.parts[i].pageRange.isNotEmpty) book.parts[i].pageRange,
+                ].join('  •  '),
+                icon: Icons.folder_rounded,
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => ChaptersPage(
+                        store: store, book: book, part: book.parts[i]),
+                  ),
+                ),
               ),
-            ),
-          ),
-      ],
-    ),
-  );
+          ],
+        ),
+      );
 }
 
 class ChaptersPage extends StatelessWidget {
-  const ChaptersPage({super.key, required this.store, required this.book, required this.part});
+  const ChaptersPage(
+      {super.key,
+      required this.store,
+      required this.book,
+      required this.part});
   final BookStore store;
   final BookData book;
   final PartData part;
 
   @override
   Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: Text(part.title, style: const TextStyle(fontWeight: FontWeight.w800))),
-    body: ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        if (part.pageRange.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: Text(part.pageRange, style: const TextStyle(color: Colors.black54)),
-          ),
-        for (final chapter in part.chapters)
-          _FolderTile(
-            title: chapter.title,
-            subtitle: [
-              '${chapter.words.length} words',
-              if (chapter.pageRange.isNotEmpty) chapter.pageRange,
-            ].join('  •  '),
-            icon: Icons.folder_open_rounded,
-            onTap: () => Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => ChapterPage(store: store, book: book, chapter: chapter),
+        appBar: AppBar(
+            title: Text(part.title,
+                style: const TextStyle(fontWeight: FontWeight.w800))),
+        body: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            if (part.pageRange.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(part.pageRange,
+                    style: const TextStyle(color: Colors.black54)),
               ),
-            ),
-          ),
-      ],
-    ),
-  );
+            for (final chapter in part.chapters)
+              _FolderTile(
+                title: chapter.title,
+                subtitle: [
+                  '${chapter.words.length} words',
+                  if (chapter.pageRange.isNotEmpty) chapter.pageRange,
+                ].join('  •  '),
+                icon: Icons.folder_open_rounded,
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) =>
+                        ChapterPage(store: store, book: book, chapter: chapter),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      );
 }
 
 class _FolderTile extends StatelessWidget {
-  const _FolderTile({required this.title, required this.subtitle, required this.icon, required this.onTap});
+  const _FolderTile(
+      {required this.title,
+      required this.subtitle,
+      required this.icon,
+      required this.onTap});
   final String title;
   final String subtitle;
   final IconData icon;
@@ -697,23 +963,30 @@ class _FolderTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Card(
-    margin: const EdgeInsets.only(bottom: 10),
-    child: ListTile(
-      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      leading: Icon(icon, color: const Color(0xFFC18A35), size: 32),
-      title: Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
-      subtitle: Padding(
-        padding: const EdgeInsets.only(top: 5),
-        child: Text(subtitle, style: const TextStyle(color: Colors.black54)),
-      ),
-      trailing: const Icon(Icons.chevron_right),
-      onTap: onTap,
-    ),
-  );
+        margin: const EdgeInsets.only(bottom: 10),
+        child: ListTile(
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          leading: Icon(icon, color: const Color(0xFFC18A35), size: 32),
+          title: Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
+          subtitle: Padding(
+            padding: const EdgeInsets.only(top: 5),
+            child: Text(subtitle, style: const TextStyle(color: Colors.black54)),
+          ),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: onTap,
+        ),
+      );
 }
 
+// ───────────────────────── Chapter page ─────────────────────────
+
 class ChapterPage extends StatefulWidget {
-  const ChapterPage({super.key, required this.store, required this.book, required this.chapter});
+  const ChapterPage(
+      {super.key,
+      required this.store,
+      required this.book,
+      required this.chapter});
   final BookStore store;
   final BookData book;
   final ChapterData chapter;
@@ -733,22 +1006,25 @@ class _ChapterPageState extends State<ChapterPage> {
       animation: widget.store,
       builder: (context, _) {
         final visible = widget.chapter.words.where((entry) {
-          final state = widget.store.getWordState(widget.book.id, entry.word);
+          final state = widget.store.getWordState(entry.word);
           final known = state == WordState.known;
           final matchesStatus = showKnown || !known;
           final matchesQuery = query.isEmpty ||
               entry.word.toLowerCase().contains(query.toLowerCase()) ||
-              entry.meanings.any((m) => m.toLowerCase().contains(query.toLowerCase()));
+              entry.meanings
+                  .any((m) => m.toLowerCase().contains(query.toLowerCase()));
           return matchesStatus && matchesQuery;
         }).toList();
 
         final knownInChapter = widget.chapter.words
-            .where((w) => widget.store.getWordState(widget.book.id, w.word) == WordState.known).length;
+            .where((w) => widget.store.getWordState(w.word) == WordState.known)
+            .length;
         final unknownInChapter = widget.chapter.words.length - knownInChapter;
 
         return Scaffold(
           appBar: AppBar(
-            title: Text(widget.chapter.title, style: const TextStyle(fontWeight: FontWeight.w800)),
+            title: Text(widget.chapter.title,
+                style: const TextStyle(fontWeight: FontWeight.w800)),
           ),
           body: Stack(
             children: [
@@ -759,20 +1035,24 @@ class _ChapterPageState extends State<ChapterPage> {
                     child: Column(
                       children: [
                         TextField(
-                          onChanged: (value) => setState(() => query = value.trim()),
+                          onChanged: (value) =>
+                              setState(() => query = value.trim()),
                           decoration: InputDecoration(
                             hintText: 'Search words or meanings',
                             prefixIcon: const Icon(Icons.search),
                             filled: true,
                             fillColor: Colors.white,
-                            contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                            contentPadding:
+                                const EdgeInsets.symmetric(vertical: 12),
                             border: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(14),
-                              borderSide: const BorderSide(color: Color(0xFFE8ECE7)),
+                              borderSide:
+                                  const BorderSide(color: Color(0xFFE8ECE7)),
                             ),
                             enabledBorder: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(14),
-                              borderSide: const BorderSide(color: Color(0xFFE8ECE7)),
+                              borderSide:
+                                  const BorderSide(color: Color(0xFFE8ECE7)),
                             ),
                           ),
                         ),
@@ -782,13 +1062,17 @@ class _ChapterPageState extends State<ChapterPage> {
                             Expanded(
                               child: Text(
                                 '$unknownInChapter unknown/review  •  $knownInChapter known',
-                                style: const TextStyle(color: Colors.black54, fontSize: 13),
+                                style: const TextStyle(
+                                    color: Colors.black54, fontSize: 13),
                               ),
                             ),
-                            const Text('Show known', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+                            const Text('Show known',
+                                style: TextStyle(
+                                    fontWeight: FontWeight.w600, fontSize: 13)),
                             Switch(
                               value: showKnown,
-                              onChanged: (value) => setState(() => showKnown = value),
+                              onChanged: (value) =>
+                                  setState(() => showKnown = value),
                             ),
                           ],
                         ),
@@ -807,21 +1091,24 @@ class _ChapterPageState extends State<ChapterPage> {
                                         ? 'This chapter has no words.'
                                         : 'All words in this chapter are marked known.',
                                 textAlign: TextAlign.center,
-                                style: const TextStyle(color: Colors.black54, fontSize: 16),
+                                style: const TextStyle(
+                                    color: Colors.black54, fontSize: 16),
                               ),
                             ),
                           )
                         : ListView.separated(
                             padding: const EdgeInsets.fromLTRB(16, 4, 16, 100),
                             itemCount: visible.length,
-                            separatorBuilder: (_, __) => const SizedBox(height: 8),
+                            separatorBuilder: (_, __) =>
+                                const SizedBox(height: 8),
                             itemBuilder: (context, index) {
                               final entry = visible[index];
-                              final state = widget.store.getWordState(widget.book.id, entry.word);
-                              
+                              final state =
+                                  widget.store.getWordState(entry.word);
+
                               Color badgeColor;
                               String badgeText;
-                              
+
                               if (state == WordState.known) {
                                 badgeColor = const Color(0xFF27845B);
                                 badgeText = 'KNOWN';
@@ -835,44 +1122,58 @@ class _ChapterPageState extends State<ChapterPage> {
 
                               return Dismissible(
                                 key: Key(entry.word),
-                                direction: state == WordState.known 
-                                    ? DismissDirection.startToEnd // Swipe right on known makes it showAgain
-                                    : DismissDirection.endToStart, // Swipe left on unknown makes it known
+                                direction: state == WordState.known
+                                    ? DismissDirection.startToEnd
+                                    : DismissDirection.endToStart,
                                 background: Container(
                                   alignment: Alignment.centerLeft,
                                   padding: const EdgeInsets.only(left: 20),
                                   color: Colors.orange.withOpacity(0.2),
-                                  child: const Icon(Icons.replay, color: Color(0xFFD97706)),
+                                  child: const Icon(Icons.replay,
+                                      color: Color(0xFFD97706)),
                                 ),
                                 secondaryBackground: Container(
                                   alignment: Alignment.centerRight,
                                   padding: const EdgeInsets.only(right: 20),
                                   decoration: BoxDecoration(
-                                    color: const Color(0xFF27845B).withOpacity(0.2),
+                                    color: const Color(0xFF27845B)
+                                        .withOpacity(0.2),
                                     borderRadius: BorderRadius.circular(18),
                                   ),
                                   child: const Row(
                                     mainAxisAlignment: MainAxisAlignment.end,
                                     children: [
-                                      Text('Known', style: TextStyle(color: Color(0xFF27845B), fontWeight: FontWeight.bold)),
+                                      Text('Known',
+                                          style: TextStyle(
+                                              color: Color(0xFF27845B),
+                                              fontWeight: FontWeight.bold)),
                                       SizedBox(width: 8),
-                                      Icon(Icons.check_circle, color: Color(0xFF27845B)),
+                                      Icon(Icons.check_circle,
+                                          color: Color(0xFF27845B)),
                                     ],
                                   ),
                                 ),
                                 confirmDismiss: (direction) async {
-                                  if (state == WordState.known && direction == DismissDirection.startToEnd) {
-                                    widget.store.setWordState(widget.book.id, entry.word, WordState.showAgain);
+                                  if (state == WordState.known &&
+                                      direction == DismissDirection.startToEnd) {
+                                    widget.store.setWordState(
+                                        entry.word, WordState.showAgain);
                                     ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(content: Text('Moved to Show Again'), duration: Duration(milliseconds: 600)),
+                                      const SnackBar(
+                                          content: Text('Moved to Show Again'),
+                                          duration:
+                                              Duration(milliseconds: 600)),
                                     );
-                                  } else if (state != WordState.known && direction == DismissDirection.endToStart) {
-                                    widget.store.setWordState(widget.book.id, entry.word, WordState.known);
+                                  } else if (state != WordState.known &&
+                                      direction == DismissDirection.endToStart) {
+                                    widget.store.setWordState(
+                                        entry.word, WordState.known);
                                     ScaffoldMessenger.of(context).showSnackBar(
                                       const SnackBar(
                                         content: Row(
                                           children: [
-                                            Icon(Icons.auto_awesome, color: Colors.amber, size: 18),
+                                            Icon(Icons.auto_awesome,
+                                                color: Colors.amber, size: 18),
                                             SizedBox(width: 8),
                                             Text('✨ Marked as Known!'),
                                           ],
@@ -882,27 +1183,33 @@ class _ChapterPageState extends State<ChapterPage> {
                                       ),
                                     );
                                   }
-                                  return false; // Prevent card from permanently disappearing from active view filters until state updates
+                                  return false;
                                 },
                                 child: Card(
                                   child: Padding(
-                                    padding: const EdgeInsets.fromLTRB(16, 13, 8, 13),
+                                    padding:
+                                        const EdgeInsets.fromLTRB(16, 13, 8, 13),
                                     child: Row(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
                                       children: [
                                         Expanded(
                                           child: Column(
-                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
                                             children: [
                                               Text(
                                                 entry.word,
-                                                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
+                                                style: const TextStyle(
+                                                    fontSize: 17,
+                                                    fontWeight: FontWeight.w800),
                                               ),
                                               const SizedBox(height: 5),
                                               Text(
                                                 entry.meanings.isEmpty
-                                                    ? 'বাংলা অর্থ পাওয়া যায়নি'
-                                                    : entry.meanings.join('  •  '),
+                                                    ? 'বাংলা অর্থ পাওয়া যায়নি'
+                                                    : entry.meanings
+                                                        .join('  •  '),
                                                 style: TextStyle(
                                                   fontSize: 15,
                                                   height: 1.45,
@@ -911,15 +1218,21 @@ class _ChapterPageState extends State<ChapterPage> {
                                                       : const Color(0xFF426B59),
                                                 ),
                                               ),
-                                              if (badgeText.isNotEmpty && (showKnown || state == WordState.showAgain))
+                                              if (badgeText.isNotEmpty &&
+                                                  (showKnown ||
+                                                      state ==
+                                                          WordState.showAgain))
                                                 Padding(
-                                                  padding: const EdgeInsets.only(top: 5),
+                                                  padding:
+                                                      const EdgeInsets.only(
+                                                          top: 5),
                                                   child: Text(
                                                     badgeText,
                                                     style: TextStyle(
                                                       color: badgeColor,
                                                       fontSize: 10,
-                                                      fontWeight: FontWeight.w800,
+                                                      fontWeight:
+                                                          FontWeight.w800,
                                                       letterSpacing: 1,
                                                     ),
                                                   ),
@@ -927,58 +1240,68 @@ class _ChapterPageState extends State<ChapterPage> {
                                             ],
                                           ),
                                         ),
-                                        // Center/Left Toggle Action Button (Unknown <-> Known)
                                         IconButton(
-                                          tooltip: state == WordState.known ? 'Mark unknown' : 'Mark known',
+                                          tooltip: state == WordState.known
+                                              ? 'Mark unknown'
+                                              : 'Mark known',
                                           onPressed: () {
-                                            final next = state == WordState.known 
-                                                ? WordState.unknown 
+                                            final next = state == WordState.known
+                                                ? WordState.unknown
                                                 : WordState.known;
-                                            widget.store.setWordState(widget.book.id, entry.word, next);
+                                            widget.store
+                                                .setWordState(entry.word, next);
                                             if (next == WordState.known) {
-                                              ScaffoldMessenger.of(context).showSnackBar(
+                                              ScaffoldMessenger.of(context)
+                                                  .showSnackBar(
                                                 const SnackBar(
                                                   content: Row(
                                                     children: [
-                                                      Icon(Icons.auto_awesome, color: Colors.amber, size: 18),
+                                                      Icon(Icons.auto_awesome,
+                                                          color: Colors.amber,
+                                                          size: 18),
                                                       SizedBox(width: 8),
                                                       Text('✨ Marked as Known!'),
                                                     ],
                                                   ),
-                                                  duration: Duration(milliseconds: 800),
-                                                  backgroundColor: Color(0xFF27845B),
+                                                  duration:
+                                                      Duration(milliseconds: 800),
+                                                  backgroundColor:
+                                                      Color(0xFF27845B),
                                                 ),
                                               );
                                             }
                                           },
                                           icon: Icon(
-                                            state == WordState.known 
-                                                ? Icons.check_circle_rounded 
+                                            state == WordState.known
+                                                ? Icons.check_circle_rounded
                                                 : Icons.radio_button_unchecked,
-                                            color: state == WordState.known 
-                                                ? const Color(0xFF27845B) 
+                                            color: state == WordState.known
+                                                ? const Color(0xFF27845B)
                                                 : Colors.black38,
                                             size: 28,
                                           ),
                                         ),
-                                        // Dedicated Right Button for "Show Again"
                                         IconButton(
                                           tooltip: 'Mark as Show Again',
                                           onPressed: () {
-                                            widget.store.setWordState(widget.book.id, entry.word, WordState.showAgain);
-                                            ScaffoldMessenger.of(context).showSnackBar(
+                                            widget.store.setWordState(
+                                                entry.word, WordState.showAgain);
+                                            ScaffoldMessenger.of(context)
+                                                .showSnackBar(
                                               const SnackBar(
-                                                content: Text('Flagged for Show Again'),
-                                                duration: Duration(milliseconds: 600),
+                                                content:
+                                                    Text('Flagged for Show Again'),
+                                                duration:
+                                                    Duration(milliseconds: 600),
                                               ),
                                             );
                                           },
                                           icon: Icon(
-                                            state == WordState.showAgain 
-                                                ? Icons.replay_circle_filled_rounded 
+                                            state == WordState.showAgain
+                                                ? Icons.replay_circle_filled_rounded
                                                 : Icons.replay,
-                                            color: state == WordState.showAgain 
-                                                ? const Color(0xFFD97706) 
+                                            color: state == WordState.showAgain
+                                                ? const Color(0xFFD97706)
                                                 : Colors.black38,
                                             size: 26,
                                           ),
@@ -993,7 +1316,6 @@ class _ChapterPageState extends State<ChapterPage> {
                   ),
                 ],
               ),
-              // Compact Bottom-Left Slider for "Mark all known" action
               Positioned(
                 left: 16,
                 bottom: 16,
@@ -1003,7 +1325,8 @@ class _ChapterPageState extends State<ChapterPage> {
                   decoration: BoxDecoration(
                     color: Colors.white,
                     borderRadius: BorderRadius.circular(30),
-                    border: Border.all(color: const Color(0xFF356859).withOpacity(0.3)),
+                    border: Border.all(
+                        color: const Color(0xFF356859).withOpacity(0.3)),
                     boxShadow: [
                       BoxShadow(
                         color: Colors.black.withOpacity(0.08),
@@ -1032,7 +1355,8 @@ class _ChapterPageState extends State<ChapterPage> {
                           activeTrackColor: Colors.transparent,
                           inactiveTrackColor: Colors.transparent,
                           thumbColor: const Color(0xFF356859),
-                          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 22),
+                          thumbShape: const RoundSliderThumbShape(
+                              enabledThumbRadius: 22),
                           overlayColor: Colors.transparent,
                         ),
                         child: Slider(
@@ -1040,14 +1364,16 @@ class _ChapterPageState extends State<ChapterPage> {
                           onChanged: (val) {
                             setState(() => _sliderValue = val);
                             if (val == 1.0) {
-                              widget.store.markAllChapterKnown(widget.book.id, widget.chapter);
+                              widget.store.markAllChapterKnown(widget.chapter);
                               ScaffoldMessenger.of(context).showSnackBar(
                                 const SnackBar(
-                                  content: Text('✨ All eligible words marked known (Show Again protected)!'),
+                                  content: Text(
+                                      '✨ All eligible words marked known (Show Again protected)!'),
                                   backgroundColor: Color(0xFF27845B),
                                 ),
                               );
-                              Future.delayed(const Duration(milliseconds: 300), () {
+                              Future.delayed(const Duration(milliseconds: 300),
+                                  () {
                                 if (mounted) setState(() => _sliderValue = 0.0);
                               });
                             }
@@ -1074,8 +1400,9 @@ class _BookProgress extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final total = store.totalUniqueWords(book);
-    final known = store.knownCount(book.id);
-    final progress = total == 0 ? 0.0 : (known / total).clamp(0.0, 1.0).toDouble();
+    final known = store.knownCount(book);
+    final progress =
+        total == 0 ? 0.0 : (known / total).clamp(0.0, 1.0).toDouble();
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -1085,8 +1412,10 @@ class _BookProgress extends StatelessWidget {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const Text('Book progress', style: TextStyle(fontWeight: FontWeight.w700)),
-                Text('$known / $total known', style: const TextStyle(color: Colors.black54, fontSize: 13)),
+                const Text('Book progress',
+                    style: TextStyle(fontWeight: FontWeight.w700)),
+                Text('$known / $total known',
+                    style: const TextStyle(color: Colors.black54, fontSize: 13)),
               ],
             ),
             const SizedBox(height: 10),
@@ -1095,6 +1424,369 @@ class _BookProgress extends StatelessWidget {
               child: LinearProgressIndicator(value: progress, minHeight: 8),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+// ───────────────────────── Bubble game ─────────────────────────
+
+class GamePage extends StatefulWidget {
+  const GamePage({super.key, required this.store, required this.book});
+  final BookStore store;
+  final BookData book;
+
+  @override
+  State<GamePage> createState() => _GamePageState();
+}
+
+class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
+  static const _green = Color(0xFF27845B);
+  static const _red = Color(0xFFC0392B);
+  static const _ink = Color(0xFF1F3D33);
+
+  late final AnimationController _enter;
+  late final AnimationController _exit;
+  late final AnimationController _idle;
+
+  late List<WordEntry> _queue;
+  int _total = 0;
+  int _knownCount = 0;
+  int _skips = 0;
+  bool _busy = false;
+  bool _exitKnown = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _enter = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 380));
+    _exit = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 220));
+    _idle = AnimationController(vsync: this, duration: const Duration(seconds: 4))
+      ..repeat();
+
+    _queue = widget.store.practiceWords(widget.book)..shuffle();
+    _total = _queue.length;
+    if (_queue.isNotEmpty) _enter.forward();
+  }
+
+  @override
+  void dispose() {
+    _enter.dispose();
+    _exit.dispose();
+    _idle.dispose();
+    super.dispose();
+  }
+
+  Future<void> _answer(bool known) async {
+    if (_busy || _queue.isEmpty) return;
+    _busy = true;
+    _exitKnown = known;
+    HapticFeedback.lightImpact();
+    await _exit.forward(from: 0);
+    if (!mounted) return;
+
+    final entry = _queue.removeAt(0);
+    if (known) {
+      _knownCount++;
+      widget.store.setWordState(entry.word, WordState.known);
+    } else {
+      // Unknown: clear showAgain globally and send the bubble to the end.
+      widget.store.setWordState(entry.word, WordState.unknown);
+      _queue.add(entry);
+      _skips++;
+    }
+
+    _enter.value = 0;
+    _exit.value = 0;
+    setState(() {});
+    _busy = false;
+    if (_queue.isNotEmpty) _enter.forward(from: 0);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.book.name,
+            style: const TextStyle(fontWeight: FontWeight.w800)),
+      ),
+      body: _queue.isEmpty ? _finished(context) : _playing(),
+    );
+  }
+
+  Widget _finished(BuildContext context) {
+    final nothing = _total == 0;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('🎉', style: TextStyle(fontSize: 64)),
+            const SizedBox(height: 14),
+            Text(
+              nothing ? 'Nothing to practise' : 'Round complete!',
+              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              nothing
+                  ? 'All words in this book are already known.'
+                  : '$_knownCount words marked known'
+                      '${_skips > 0 ? '  •  $_skips skipped' : ''}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.black54, fontSize: 16),
+            ),
+            const SizedBox(height: 24),
+            FilledButton.icon(
+              onPressed: () => Navigator.pop(context),
+              icon: const Icon(Icons.arrow_back),
+              label: const Text('Back to books'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _playing() {
+    final progress = _total == 0 ? 0.0 : _knownCount / _total;
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+          child: Column(
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text('$_knownCount known  •  ${_queue.length} left',
+                      style: const TextStyle(
+                          color: Colors.black54, fontWeight: FontWeight.w600)),
+                  Text('Skipped $_skips',
+                      style: const TextStyle(color: Colors.black45)),
+                ],
+              ),
+              const SizedBox(height: 8),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(20),
+                child: LinearProgressIndicator(value: progress, minHeight: 8),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, c) {
+              final w = c.maxWidth;
+              final h = c.maxHeight;
+              final d = math.min(math.min(w * 0.88, h * 0.86), 360.0);
+              const previewAlign = [
+                Alignment(-0.82, -0.85),
+                Alignment(0.85, -0.6),
+                Alignment(-0.7, 0.85),
+              ];
+              const previewSize = [0.26, 0.19, 0.22];
+              final previewCount = math.min(_queue.length - 1, 3);
+
+              return AnimatedBuilder(
+                animation: Listenable.merge([_enter, _exit, _idle]),
+                builder: (context, _) {
+                  if (_queue.isEmpty) return const SizedBox.shrink();
+                  final phase = _idle.value * 2 * math.pi;
+                  final enterT = Curves.easeOutCubic.transform(_enter.value);
+
+                  double dx = math.sin(phase) * 6;
+                  double dy = math.cos(phase) * 8 + (1 - enterT) * h * 0.8;
+                  double scale = 1;
+                  double opacity = math.min(1.0, _enter.value * 3);
+
+                  if (_exit.value > 0) {
+                    final t = Curves.easeIn.transform(_exit.value);
+                    if (_exitKnown) {
+                      // Pop
+                      scale = 1 + 0.35 * t;
+                      opacity *= (1 - t);
+                      dy -= h * 0.04 * t;
+                    } else {
+                      // Fly off toward the Unknown button (bottom-left)
+                      dx -= w * 0.45 * t;
+                      dy += h * 0.3 * t;
+                      scale = 1 - 0.6 * t;
+                      opacity *= (1 - t);
+                    }
+                  }
+
+                  return Stack(
+                    clipBehavior: Clip.hardEdge,
+                    children: [
+                      for (var i = 0; i < previewCount; i++)
+                        Align(
+                          alignment: previewAlign[i],
+                          child: Transform.translate(
+                            offset: Offset(math.sin(phase + i * 2) * 5,
+                                math.cos(phase + i * 2) * 7),
+                            child: Container(
+                              width: d * previewSize[i],
+                              height: d * previewSize[i],
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: const Color(0xFF356859).withOpacity(0.08),
+                                border: Border.all(
+                                  color:
+                                      const Color(0xFF356859).withOpacity(0.18),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      Center(
+                        child: Transform.translate(
+                          offset: Offset(dx, dy),
+                          child: Transform.scale(
+                            scale: scale,
+                            child: Opacity(
+                              opacity: opacity.clamp(0.0, 1.0),
+                              child: _bubble(_queue.first, d),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              );
+            },
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: SafeArea(
+            top: false,
+            minimum: const EdgeInsets.only(bottom: 16),
+            child: Row(
+              children: [
+                Expanded(
+                  child: SizedBox(
+                    height: 64,
+                    child: FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: _red,
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(20)),
+                      ),
+                      onPressed: () => _answer(false),
+                      icon: const Icon(Icons.close_rounded, size: 28),
+                      label: const Text('Unknown',
+                          style: TextStyle(
+                              fontSize: 17, fontWeight: FontWeight.w800)),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: SizedBox(
+                    height: 64,
+                    child: FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: _green,
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(20)),
+                      ),
+                      onPressed: () => _answer(true),
+                      icon: const Icon(Icons.check_rounded, size: 28),
+                      label: const Text('Known',
+                          style: TextStyle(
+                              fontSize: 17, fontWeight: FontWeight.w800)),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _bubble(WordEntry entry, double d) {
+    final state = widget.store.getWordState(entry.word);
+    final meaning = entry.meanings.isEmpty
+        ? 'বাংলা অর্থ পাওয়া যায়নি'
+        : entry.meanings.join('  •  ');
+
+    return Container(
+      width: d,
+      height: d,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: const RadialGradient(
+          center: Alignment(-0.35, -0.4),
+          radius: 0.95,
+          colors: [Colors.white, Color(0xFFE3F1EA), Color(0xFFBFDCCE)],
+          stops: [0.0, 0.65, 1.0],
+        ),
+        border: Border.all(
+            color: const Color(0xFF356859).withOpacity(0.35), width: 2),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFF356859).withOpacity(0.22),
+            blurRadius: 28,
+            offset: const Offset(0, 12),
+          ),
+        ],
+      ),
+      alignment: Alignment.center,
+      child: SizedBox(
+        width: d * 0.72,
+        height: d * 0.6,
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: SizedBox(
+            width: d * 0.72,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (state == WordState.showAgain)
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 6),
+                    child: Text(
+                      'SHOW AGAIN',
+                      style: TextStyle(
+                        color: Color(0xFFD97706),
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1,
+                      ),
+                    ),
+                  ),
+                Text(
+                  entry.word,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 32,
+                    fontWeight: FontWeight.w900,
+                    color: _ink,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  meaning,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 20,
+                    height: 1.4,
+                    color: entry.meanings.isEmpty
+                        ? Colors.black38
+                        : const Color(0xFF426B59),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
