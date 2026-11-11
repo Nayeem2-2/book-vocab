@@ -94,10 +94,13 @@ class BookData {
   final String jsonPath;
 }
 
+enum WordState { unknown, known, showAgain }
+
 class BookStore extends ChangeNotifier {
   late SharedPreferences _prefs;
   final List<BookData> books = [];
-  final Map<String, Set<String>> _knownWords = {};
+  
+  final Map<String, Map<String, WordState>> _wordStates = {};
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
@@ -121,12 +124,23 @@ class BookStore extends ChangeNotifier {
           parts: parts,
           jsonPath: path,
         ));
-        _knownWords[id] = (_prefs.getStringList('known_$id') ?? [])
-            .map(normalizeWord)
-            .toSet();
-      } catch (_) {
-        // Ignore an individual damaged record; other books remain available.
-      }
+        
+        final stateMap = <String, WordState>{};
+        final storedStates = _prefs.getStringList('states_$id') ?? [];
+        for (final entryStr in storedStates) {
+          final partsList = entryStr.split(':');
+          if (partsList.length == 2) {
+            final w = partsList[0];
+            final stateName = partsList[1];
+            if (stateName == 'known') {
+              stateMap[w] = WordState.known;
+            } else if (stateName == 'showAgain') {
+              stateMap[w] = WordState.showAgain;
+            }
+          }
+        }
+        _wordStates[id] = stateMap;
+      } catch (_) {}
     }
   }
 
@@ -139,10 +153,15 @@ class BookStore extends ChangeNotifier {
 
   static String normalizeWord(String word) => word.trim().toLowerCase();
 
-  bool isKnown(String bookId, String word) =>
-      (_knownWords[bookId] ?? {}).contains(normalizeWord(word));
+  WordState getWordState(String bookId, String word) {
+    return _wordStates[bookId]?[normalizeWord(word)] ?? WordState.unknown;
+  }
 
-  int knownCount(String bookId) => (_knownWords[bookId] ?? {}).length;
+  int knownCount(String bookId) {
+    final map = _wordStates[bookId];
+    if (map == null) return 0;
+    return map.values.where((s) => s == WordState.known).length;
+  }
 
   int totalUniqueWords(BookData book) {
     final all = <String>{};
@@ -156,16 +175,44 @@ class BookStore extends ChangeNotifier {
     return all.length;
   }
 
-  Future<void> toggleKnown(String bookId, String word) async {
-    final set = _knownWords.putIfAbsent(bookId, () => <String>{});
+  Future<void> setWordState(String bookId, String word, WordState newState) async {
+    final map = _wordStates.putIfAbsent(bookId, () => <String, WordState>{});
     final key = normalizeWord(word);
-    if (set.contains(key)) {
-      set.remove(key);
+    
+    if (newState == WordState.unknown) {
+      map.remove(key);
     } else {
-      set.add(key);
+      map[key] = newState;
     }
-    await _prefs.setStringList('known_$bookId', set.toList()..sort());
+    await _saveStates(bookId);
     notifyListeners();
+  }
+
+  Future<void> markAllChapterKnown(String bookId, ChapterData chapter) async {
+    final map = _wordStates.putIfAbsent(bookId, () => <String, WordState>{});
+    for (final entry in chapter.words) {
+      final key = normalizeWord(entry.word);
+      final currentState = map[key] ?? WordState.unknown;
+      
+      if (currentState != WordState.showAgain) {
+        map[key] = WordState.known;
+      }
+    }
+    await _saveStates(bookId);
+    notifyListeners();
+  }
+
+  Future<void> _saveStates(String bookId) async {
+    final map = _wordStates[bookId] ?? {};
+    final list = <String>[];
+    map.forEach((w, state) {
+      if (state == WordState.known) {
+        list.add('$w:known');
+      } else if (state == WordState.showAgain) {
+        list.add('$w:showAgain');
+      }
+    });
+    await _prefs.setStringList('states_$bookId', list);
   }
 
   Future<String?> importBook() async {
@@ -205,8 +252,8 @@ class BookStore extends ChangeNotifier {
       jsonPath: path,
     );
     books.add(book);
-    _knownWords[id] = <String>{};
-    await _prefs.setStringList('known_$id', []);
+    _wordStates[id] = <String, WordState>{};
+    await _prefs.setStringList('states_$id', []);
     await _saveBookRecords();
     notifyListeners();
     return id;
@@ -214,10 +261,10 @@ class BookStore extends ChangeNotifier {
 
   Future<void> removeBook(BookData book) async {
     books.removeWhere((b) => b.id == book.id);
-    _knownWords.remove(book.id);
+    _wordStates.remove(book.id);
     final file = File(book.jsonPath);
     if (await file.exists()) await file.delete();
-    await _prefs.remove('known_${book.id}');
+    await _prefs.remove('states_${book.id}');
     await _saveBookRecords();
     notifyListeners();
   }
@@ -678,6 +725,7 @@ class ChapterPage extends StatefulWidget {
 class _ChapterPageState extends State<ChapterPage> {
   bool showKnown = false;
   String query = '';
+  double _sliderValue = 0.0;
 
   @override
   Widget build(BuildContext context) {
@@ -685,7 +733,8 @@ class _ChapterPageState extends State<ChapterPage> {
       animation: widget.store,
       builder: (context, _) {
         final visible = widget.chapter.words.where((entry) {
-          final known = widget.store.isKnown(widget.book.id, entry.word);
+          final state = widget.store.getWordState(widget.book.id, entry.word);
+          final known = state == WordState.known;
           final matchesStatus = showKnown || !known;
           final matchesQuery = query.isEmpty ||
               entry.word.toLowerCase().contains(query.toLowerCase()) ||
@@ -694,137 +743,320 @@ class _ChapterPageState extends State<ChapterPage> {
         }).toList();
 
         final knownInChapter = widget.chapter.words
-            .where((w) => widget.store.isKnown(widget.book.id, w.word)).length;
+            .where((w) => widget.store.getWordState(widget.book.id, w.word) == WordState.known).length;
         final unknownInChapter = widget.chapter.words.length - knownInChapter;
 
         return Scaffold(
           appBar: AppBar(
             title: Text(widget.chapter.title, style: const TextStyle(fontWeight: FontWeight.w800)),
           ),
-          body: Column(
+          body: Stack(
             children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                child: Column(
-                  children: [
-                    TextField(
-                      onChanged: (value) => setState(() => query = value.trim()),
-                      decoration: InputDecoration(
-                        hintText: 'Search words or meanings',
-                        prefixIcon: const Icon(Icons.search),
-                        filled: true,
-                        fillColor: Colors.white,
-                        contentPadding: const EdgeInsets.symmetric(vertical: 12),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(14),
-                          borderSide: const BorderSide(color: Color(0xFFE8ECE7)),
-                        ),
-                        enabledBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(14),
-                          borderSide: const BorderSide(color: Color(0xFFE8ECE7)),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    Row(
+              Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                    child: Column(
                       children: [
-                        Expanded(
-                          child: Text(
-                            '$unknownInChapter unknown  •  $knownInChapter known',
-                            style: const TextStyle(color: Colors.black54, fontSize: 13),
+                        TextField(
+                          onChanged: (value) => setState(() => query = value.trim()),
+                          decoration: InputDecoration(
+                            hintText: 'Search words or meanings',
+                            prefixIcon: const Icon(Icons.search),
+                            filled: true,
+                            fillColor: Colors.white,
+                            contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(14),
+                              borderSide: const BorderSide(color: Color(0xFFE8ECE7)),
+                            ),
+                            enabledBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(14),
+                              borderSide: const BorderSide(color: Color(0xFFE8ECE7)),
+                            ),
                           ),
                         ),
-                        const Text('Show known', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
-                        Switch(
-                          value: showKnown,
-                          onChanged: (value) => setState(() => showKnown = value),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                '$unknownInChapter unknown/review  •  $knownInChapter known',
+                                style: const TextStyle(color: Colors.black54, fontSize: 13),
+                              ),
+                            ),
+                            const Text('Show known', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+                            Switch(
+                              value: showKnown,
+                              onChanged: (value) => setState(() => showKnown = value),
+                            ),
+                          ],
                         ),
                       ],
                     ),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: visible.isEmpty
-                    ? Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(28),
-                          child: Text(
-                            query.isNotEmpty
-                                ? 'No matching words.'
-                                : showKnown
-                                    ? 'This chapter has no words.'
-                                    : 'All words in this chapter are marked known.',
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(color: Colors.black54, fontSize: 16),
-                          ),
-                        ),
-                      )
-                    : ListView.separated(
-                        padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
-                        itemCount: visible.length,
-                        separatorBuilder: (_, __) => const SizedBox(height: 8),
-                        itemBuilder: (context, index) {
-                          final entry = visible[index];
-                          final known = widget.store.isKnown(widget.book.id, entry.word);
-                          return Card(
+                  ),
+                  Expanded(
+                    child: visible.isEmpty
+                        ? Center(
                             child: Padding(
-                              padding: const EdgeInsets.fromLTRB(16, 13, 8, 13),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Expanded(
-                                    child: Column(
+                              padding: const EdgeInsets.all(28),
+                              child: Text(
+                                query.isNotEmpty
+                                    ? 'No matching words.'
+                                    : showKnown
+                                        ? 'This chapter has no words.'
+                                        : 'All words in this chapter are marked known.',
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(color: Colors.black54, fontSize: 16),
+                              ),
+                            ),
+                          )
+                        : ListView.separated(
+                            padding: const EdgeInsets.fromLTRB(16, 4, 16, 100),
+                            itemCount: visible.length,
+                            separatorBuilder: (_, __) => const SizedBox(height: 8),
+                            itemBuilder: (context, index) {
+                              final entry = visible[index];
+                              final state = widget.store.getWordState(widget.book.id, entry.word);
+                              
+                              Color badgeColor;
+                              String badgeText;
+                              
+                              if (state == WordState.known) {
+                                badgeColor = const Color(0xFF27845B);
+                                badgeText = 'KNOWN';
+                              } else if (state == WordState.showAgain) {
+                                badgeColor = const Color(0xFFD97706);
+                                badgeText = 'SHOW AGAIN';
+                              } else {
+                                badgeColor = Colors.transparent;
+                                badgeText = '';
+                              }
+
+                              return Dismissible(
+                                key: Key(entry.word),
+                                direction: state == WordState.known 
+                                    ? DismissDirection.startToEnd // Swipe right on known makes it showAgain
+                                    : DismissDirection.endToStart, // Swipe left on unknown makes it known
+                                background: Container(
+                                  alignment: Alignment.centerLeft,
+                                  padding: const EdgeInsets.only(left: 20),
+                                  color: Colors.orange.withOpacity(0.2),
+                                  child: const Icon(Icons.replay, color: Color(0xFFD97706)),
+                                ),
+                                secondaryBackground: Container(
+                                  alignment: Alignment.centerRight,
+                                  padding: const EdgeInsets.only(right: 20),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF27845B).withOpacity(0.2),
+                                    borderRadius: BorderRadius.circular(18),
+                                  ),
+                                  child: const Row(
+                                    mainAxisAlignment: MainAxisAlignment.end,
+                                    children: [
+                                      Text('Known', style: TextStyle(color: Color(0xFF27845B), fontWeight: FontWeight.bold)),
+                                      SizedBox(width: 8),
+                                      Icon(Icons.check_circle, color: Color(0xFF27845B)),
+                                    ],
+                                  ),
+                                ),
+                                confirmDismiss: (direction) async {
+                                  if (state == WordState.known && direction == DismissDirection.startToEnd) {
+                                    widget.store.setWordState(widget.book.id, entry.word, WordState.showAgain);
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(content: Text('Moved to Show Again'), duration: Duration(milliseconds: 600)),
+                                    );
+                                  } else if (state != WordState.known && direction == DismissDirection.endToStart) {
+                                    widget.store.setWordState(widget.book.id, entry.word, WordState.known);
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(
+                                        content: Row(
+                                          children: [
+                                            Icon(Icons.auto_awesome, color: Colors.amber, size: 18),
+                                            SizedBox(width: 8),
+                                            Text('✨ Marked as Known!'),
+                                          ],
+                                        ),
+                                        duration: Duration(milliseconds: 800),
+                                        backgroundColor: Color(0xFF27845B),
+                                      ),
+                                    );
+                                  }
+                                  return false; // Prevent card from permanently disappearing from active view filters until state updates
+                                },
+                                child: Card(
+                                  child: Padding(
+                                    padding: const EdgeInsets.fromLTRB(16, 13, 8, 13),
+                                    child: Row(
                                       crossAxisAlignment: CrossAxisAlignment.start,
                                       children: [
-                                        Text(
-                                          entry.word,
-                                          style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
-                                        ),
-                                        const SizedBox(height: 5),
-                                        Text(
-                                          entry.meanings.isEmpty
-                                              ? 'বাংলা অর্থ পাওয়া যায়নি'
-                                              : entry.meanings.join('  •  '),
-                                          style: TextStyle(
-                                            fontSize: 15,
-                                            height: 1.45,
-                                            color: entry.meanings.isEmpty
-                                                ? Colors.black38
-                                                : const Color(0xFF426B59),
-                                          ),
-                                        ),
-                                        if (showKnown && known)
-                                          const Padding(
-                                            padding: EdgeInsets.only(top: 5),
-                                            child: Text(
-                                              'KNOWN',
-                                              style: TextStyle(
-                                                color: Color(0xFF27845B),
-                                                fontSize: 10,
-                                                fontWeight: FontWeight.w800,
-                                                letterSpacing: 1,
+                                        Expanded(
+                                          child: Column(
+                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                entry.word,
+                                                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
                                               ),
-                                            ),
+                                              const SizedBox(height: 5),
+                                              Text(
+                                                entry.meanings.isEmpty
+                                                    ? 'বাংলা অর্থ পাওয়া যায়নি'
+                                                    : entry.meanings.join('  •  '),
+                                                style: TextStyle(
+                                                  fontSize: 15,
+                                                  height: 1.45,
+                                                  color: entry.meanings.isEmpty
+                                                      ? Colors.black38
+                                                      : const Color(0xFF426B59),
+                                                ),
+                                              ),
+                                              if (badgeText.isNotEmpty && (showKnown || state == WordState.showAgain))
+                                                Padding(
+                                                  padding: const EdgeInsets.only(top: 5),
+                                                  child: Text(
+                                                    badgeText,
+                                                    style: TextStyle(
+                                                      color: badgeColor,
+                                                      fontSize: 10,
+                                                      fontWeight: FontWeight.w800,
+                                                      letterSpacing: 1,
+                                                    ),
+                                                  ),
+                                                ),
+                                            ],
                                           ),
+                                        ),
+                                        // Center/Left Toggle Action Button (Unknown <-> Known)
+                                        IconButton(
+                                          tooltip: state == WordState.known ? 'Mark unknown' : 'Mark known',
+                                          onPressed: () {
+                                            final next = state == WordState.known 
+                                                ? WordState.unknown 
+                                                : WordState.known;
+                                            widget.store.setWordState(widget.book.id, entry.word, next);
+                                            if (next == WordState.known) {
+                                              ScaffoldMessenger.of(context).showSnackBar(
+                                                const SnackBar(
+                                                  content: Row(
+                                                    children: [
+                                                      Icon(Icons.auto_awesome, color: Colors.amber, size: 18),
+                                                      SizedBox(width: 8),
+                                                      Text('✨ Marked as Known!'),
+                                                    ],
+                                                  ),
+                                                  duration: Duration(milliseconds: 800),
+                                                  backgroundColor: Color(0xFF27845B),
+                                                ),
+                                              );
+                                            }
+                                          },
+                                          icon: Icon(
+                                            state == WordState.known 
+                                                ? Icons.check_circle_rounded 
+                                                : Icons.radio_button_unchecked,
+                                            color: state == WordState.known 
+                                                ? const Color(0xFF27845B) 
+                                                : Colors.black38,
+                                            size: 28,
+                                          ),
+                                        ),
+                                        // Dedicated Right Button for "Show Again"
+                                        IconButton(
+                                          tooltip: 'Mark as Show Again',
+                                          onPressed: () {
+                                            widget.store.setWordState(widget.book.id, entry.word, WordState.showAgain);
+                                            ScaffoldMessenger.of(context).showSnackBar(
+                                              const SnackBar(
+                                                content: Text('Flagged for Show Again'),
+                                                duration: Duration(milliseconds: 600),
+                                              ),
+                                            );
+                                          },
+                                          icon: Icon(
+                                            state == WordState.showAgain 
+                                                ? Icons.replay_circle_filled_rounded 
+                                                : Icons.replay,
+                                            color: state == WordState.showAgain 
+                                                ? const Color(0xFFD97706) 
+                                                : Colors.black38,
+                                            size: 26,
+                                          ),
+                                        ),
                                       ],
                                     ),
                                   ),
-                                  IconButton(
-                                    tooltip: known ? 'Mark as unknown' : 'Mark as known',
-                                    onPressed: () => widget.store.toggleKnown(widget.book.id, entry.word),
-                                    icon: Icon(
-                                      known ? Icons.check_circle_rounded : Icons.radio_button_unchecked,
-                                      color: known ? const Color(0xFF27845B) : Colors.black38,
-                                      size: 28,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          );
-                        },
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+              // Compact Bottom-Left Slider for "Mark all known" action
+              Positioned(
+                left: 16,
+                bottom: 16,
+                child: Container(
+                  width: 220,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(30),
+                    border: Border.all(color: const Color(0xFF356859).withOpacity(0.3)),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.08),
+                        blurRadius: 8,
+                        offset: const Offset(0, 4),
                       ),
+                    ],
+                  ),
+                  child: Stack(
+                    alignment: Alignment.centerLeft,
+                    children: [
+                      const Padding(
+                        padding: EdgeInsets.only(left: 45),
+                        child: Text(
+                          'Slide to mark all →',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: Color(0xFF356859),
+                          ),
+                        ),
+                      ),
+                      SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 48,
+                          activeTrackColor: Colors.transparent,
+                          inactiveTrackColor: Colors.transparent,
+                          thumbColor: const Color(0xFF356859),
+                          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 22),
+                          overlayColor: Colors.transparent,
+                        ),
+                        child: Slider(
+                          value: _sliderValue,
+                          onChanged: (val) {
+                            setState(() => _sliderValue = val);
+                            if (val == 1.0) {
+                              widget.store.markAllChapterKnown(widget.book.id, widget.chapter);
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('✨ All eligible words marked known (Show Again protected)!'),
+                                  backgroundColor: Color(0xFF27845B),
+                                ),
+                              );
+                              Future.delayed(const Duration(milliseconds: 300), () {
+                                if (mounted) setState(() => _sliderValue = 0.0);
+                              });
+                            }
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ],
           ),
