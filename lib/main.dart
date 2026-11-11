@@ -97,9 +97,27 @@ class BookData {
   final String fileName;
   final List<PartData> parts;
   final String jsonPath;
+
+  List<ChapterData> get allChapters =>
+      [for (final p in parts) ...p.chapters];
 }
 
 enum WordState { unknown, known, showAgain }
+
+/// How many distinct words in a scope are still to practise.
+class PracticeCounts {
+  const PracticeCounts(this.unknown, this.showAgain);
+  final int unknown;
+  final int showAgain;
+  int get total => unknown + showAgain;
+}
+
+/// What the user ticked in the play options sheet.
+class PlayChoice {
+  const PlayChoice({required this.unknown, required this.showAgain});
+  final bool unknown;
+  final bool showAgain;
+}
 
 // ───────────────────────── Store ─────────────────────────
 
@@ -318,24 +336,52 @@ class BookStore extends ChangeNotifier {
   int knownCount(BookData book) =>
       uniqueWords(book).where(_known.contains).length;
 
-  /// Distinct words of a book that are not known (unknown + showAgain).
-  List<WordEntry> practiceWords(BookData book) {
+  /// Distinct words in the given chapters that are unknown / show again.
+  /// Known words are never counted. Words are global, so a word that is
+  /// known anywhere is known everywhere.
+  PracticeCounts practiceCounts(List<ChapterData> chapters) {
+    final seen = <String>{};
+    var unknown = 0;
+    var again = 0;
+    for (final chapter in chapters) {
+      for (final entry in chapter.words) {
+        final key = normalizeWord(entry.word);
+        if (!seen.add(key)) continue;
+        if (_known.contains(key)) continue;
+        if (_showAgain.contains(key)) {
+          again++;
+        } else {
+          unknown++;
+        }
+      }
+    }
+    return PracticeCounts(unknown, again);
+  }
+
+  /// Distinct words of the given chapters to play, filtered by what the
+  /// user ticked. Known words are always excluded.
+  List<WordEntry> practiceWords(
+    List<ChapterData> chapters, {
+    bool includeUnknown = true,
+    bool includeShowAgain = true,
+  }) {
     final byKey = <String, WordEntry>{};
-    for (final part in book.parts) {
-      for (final chapter in part.chapters) {
-        for (final entry in chapter.words) {
-          final key = normalizeWord(entry.word);
-          if (_known.contains(key)) continue;
-          final existing = byKey[key];
-          if (existing == null) {
-            byKey[key] = WordEntry(
-              word: entry.word,
-              meanings: List<String>.from(entry.meanings),
-            );
-          } else {
-            for (final m in entry.meanings) {
-              if (!existing.meanings.contains(m)) existing.meanings.add(m);
-            }
+    for (final chapter in chapters) {
+      for (final entry in chapter.words) {
+        final key = normalizeWord(entry.word);
+        if (_known.contains(key)) continue;
+        final isAgain = _showAgain.contains(key);
+        if (isAgain && !includeShowAgain) continue;
+        if (!isAgain && !includeUnknown) continue;
+        final existing = byKey[key];
+        if (existing == null) {
+          byKey[key] = WordEntry(
+            word: entry.word,
+            meanings: List<String>.from(entry.meanings),
+          );
+        } else {
+          for (final m in entry.meanings) {
+            if (!existing.meanings.contains(m)) existing.meanings.add(m);
           }
         }
       }
@@ -682,6 +728,162 @@ class JsonBookParser {
   }
 }
 
+// ───────────────────────── Play button + options ─────────────────────────
+
+/// Opens the play options sheet for a scope (book / part / chapter) and,
+/// if confirmed, starts the game with only the ticked kinds of words.
+Future<void> startGame(
+  BuildContext context,
+  BookStore store,
+  String title,
+  List<ChapterData> chapters,
+) async {
+  final counts = store.practiceCounts(chapters);
+  if (counts.total == 0) return;
+
+  final choice = await showModalBottomSheet<PlayChoice>(
+    context: context,
+    showDragHandle: true,
+    backgroundColor: Colors.white,
+    builder: (_) => _PlayOptionsSheet(title: title, counts: counts),
+  );
+  if (choice == null || !context.mounted) return;
+
+  Navigator.push(
+    context,
+    MaterialPageRoute(
+      builder: (_) => GamePage(
+        store: store,
+        title: title,
+        chapters: chapters,
+        includeUnknown: choice.unknown,
+        includeShowAgain: choice.showAgain,
+      ),
+    ),
+  );
+}
+
+class _PlayOptionsSheet extends StatefulWidget {
+  const _PlayOptionsSheet({required this.title, required this.counts});
+  final String title;
+  final PracticeCounts counts;
+
+  @override
+  State<_PlayOptionsSheet> createState() => _PlayOptionsSheetState();
+}
+
+class _PlayOptionsSheetState extends State<_PlayOptionsSheet> {
+  late bool _unknown = widget.counts.unknown > 0;
+  late bool _again = widget.counts.showAgain > 0;
+
+  int get _selected =>
+      (_unknown ? widget.counts.unknown : 0) +
+      (_again ? widget.counts.showAgain : 0);
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.counts;
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(widget.title,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style:
+                    const TextStyle(fontSize: 19, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 4),
+            const Text('Choose which words to play',
+                style: TextStyle(color: Colors.black54)),
+            const SizedBox(height: 8),
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              value: _unknown,
+              onChanged: c.unknown > 0
+                  ? (v) => setState(() => _unknown = v ?? false)
+                  : null,
+              title: const Text('Unknown',
+                  style: TextStyle(fontWeight: FontWeight.w700)),
+              subtitle: Text('${c.unknown} words not marked yet'),
+            ),
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              value: _again,
+              onChanged: c.showAgain > 0
+                  ? (v) => setState(() => _again = v ?? false)
+                  : null,
+              title: const Text('Show again',
+                  style: TextStyle(fontWeight: FontWeight.w700)),
+              subtitle: Text('${c.showAgain} words flagged to review'),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              height: 52,
+              child: FilledButton.icon(
+                onPressed: _selected == 0
+                    ? null
+                    : () => Navigator.pop(
+                          context,
+                          PlayChoice(unknown: _unknown, showAgain: _again),
+                        ),
+                icon: const Icon(Icons.play_arrow_rounded),
+                label: Text(
+                  _selected == 0
+                      ? 'Tick at least one option'
+                      : 'Start  •  $_selected words',
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Play icon used on books, parts and chapters. Faded and disabled when the
+/// scope has no unknown / show again words left.
+class PlayButton extends StatelessWidget {
+  const PlayButton({
+    super.key,
+    required this.store,
+    required this.title,
+    required this.chapters,
+    this.size = 32,
+  });
+  final BookStore store;
+  final String title;
+  final List<ChapterData> chapters;
+  final double size;
+
+  static const _green = Color(0xFF356859);
+
+  @override
+  Widget build(BuildContext context) {
+    final counts = store.practiceCounts(chapters);
+    final enabled = counts.total > 0;
+    return IconButton(
+      tooltip: enabled
+          ? 'Play • ${counts.total} words to practise'
+          : 'Nothing to practise',
+      icon: Icon(
+        Icons.play_circle_fill_rounded,
+        size: size,
+        color: enabled ? _green : _green.withOpacity(0.25),
+      ),
+      onPressed:
+          enabled ? () => startGame(context, store, title, chapters) : null,
+    );
+  }
+}
+
 // ───────────────────────── Books page ─────────────────────────
 
 class BooksPage extends StatelessWidget {
@@ -805,17 +1007,11 @@ class BooksPage extends StatelessWidget {
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          IconButton(
-                            tooltip: 'Play word bubbles',
-                            icon: const Icon(Icons.play_circle_fill_rounded,
-                                size: 34, color: Color(0xFF356859)),
-                            onPressed: () => Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) =>
-                                    GamePage(store: store, book: book),
-                              ),
-                            ),
+                          PlayButton(
+                            store: store,
+                            title: book.name,
+                            chapters: book.allChapters,
+                            size: 34,
                           ),
                           const Icon(Icons.chevron_right),
                         ],
@@ -875,32 +1071,41 @@ class PartsPage extends StatelessWidget {
   final BookData book;
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(
-            title: Text(book.name,
-                style: const TextStyle(fontWeight: FontWeight.w800))),
-        body: ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            _BookProgress(store: store, book: book),
-            const SizedBox(height: 14),
-            for (var i = 0; i < book.parts.length; i++)
-              _FolderTile(
-                title: book.parts[i].title,
-                subtitle: [
-                  '${book.parts[i].chapters.length} Chapters',
-                  if (book.parts[i].pageRange.isNotEmpty) book.parts[i].pageRange,
-                ].join('  •  '),
-                icon: Icons.folder_rounded,
-                onTap: () => Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => ChaptersPage(
-                        store: store, book: book, part: book.parts[i]),
+  Widget build(BuildContext context) => AnimatedBuilder(
+        animation: store,
+        builder: (context, _) => Scaffold(
+          appBar: AppBar(
+              title: Text(book.name,
+                  style: const TextStyle(fontWeight: FontWeight.w800))),
+          body: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              _BookProgress(store: store, book: book),
+              const SizedBox(height: 14),
+              for (var i = 0; i < book.parts.length; i++)
+                _FolderTile(
+                  title: book.parts[i].title,
+                  subtitle: [
+                    '${book.parts[i].chapters.length} Chapters',
+                    if (book.parts[i].pageRange.isNotEmpty)
+                      book.parts[i].pageRange,
+                  ].join('  •  '),
+                  icon: Icons.folder_rounded,
+                  play: PlayButton(
+                    store: store,
+                    title: book.parts[i].title,
+                    chapters: book.parts[i].chapters,
+                  ),
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => ChaptersPage(
+                          store: store, book: book, part: book.parts[i]),
+                    ),
                   ),
                 ),
-              ),
-          ],
+            ],
+          ),
         ),
       );
 }
@@ -916,36 +1121,44 @@ class ChaptersPage extends StatelessWidget {
   final PartData part;
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(
-            title: Text(part.title,
-                style: const TextStyle(fontWeight: FontWeight.w800))),
-        body: ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            if (part.pageRange.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: Text(part.pageRange,
-                    style: const TextStyle(color: Colors.black54)),
-              ),
-            for (final chapter in part.chapters)
-              _FolderTile(
-                title: chapter.title,
-                subtitle: [
-                  '${chapter.words.length} words',
-                  if (chapter.pageRange.isNotEmpty) chapter.pageRange,
-                ].join('  •  '),
-                icon: Icons.folder_open_rounded,
-                onTap: () => Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) =>
-                        ChapterPage(store: store, book: book, chapter: chapter),
+  Widget build(BuildContext context) => AnimatedBuilder(
+        animation: store,
+        builder: (context, _) => Scaffold(
+          appBar: AppBar(
+              title: Text(part.title,
+                  style: const TextStyle(fontWeight: FontWeight.w800))),
+          body: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              if (part.pageRange.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Text(part.pageRange,
+                      style: const TextStyle(color: Colors.black54)),
+                ),
+              for (final chapter in part.chapters)
+                _FolderTile(
+                  title: chapter.title,
+                  subtitle: [
+                    '${chapter.words.length} words',
+                    if (chapter.pageRange.isNotEmpty) chapter.pageRange,
+                  ].join('  •  '),
+                  icon: Icons.folder_open_rounded,
+                  play: PlayButton(
+                    store: store,
+                    title: chapter.title,
+                    chapters: [chapter],
+                  ),
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => ChapterPage(
+                          store: store, book: book, chapter: chapter),
+                    ),
                   ),
                 ),
-              ),
-          ],
+            ],
+          ),
         ),
       );
 }
@@ -955,11 +1168,13 @@ class _FolderTile extends StatelessWidget {
       {required this.title,
       required this.subtitle,
       required this.icon,
-      required this.onTap});
+      required this.onTap,
+      this.play});
   final String title;
   final String subtitle;
   final IconData icon;
   final VoidCallback onTap;
+  final Widget? play;
 
   @override
   Widget build(BuildContext context) => Card(
@@ -973,7 +1188,13 @@ class _FolderTile extends StatelessWidget {
             padding: const EdgeInsets.only(top: 5),
             child: Text(subtitle, style: const TextStyle(color: Colors.black54)),
           ),
-          trailing: const Icon(Icons.chevron_right),
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (play != null) play!,
+              const Icon(Icons.chevron_right),
+            ],
+          ),
           onTap: onTap,
         ),
       );
@@ -1025,6 +1246,14 @@ class _ChapterPageState extends State<ChapterPage> {
           appBar: AppBar(
             title: Text(widget.chapter.title,
                 style: const TextStyle(fontWeight: FontWeight.w800)),
+            actions: [
+              PlayButton(
+                store: widget.store,
+                title: widget.chapter.title,
+                chapters: [widget.chapter],
+              ),
+              const SizedBox(width: 4),
+            ],
           ),
           body: Stack(
             children: [
@@ -1433,9 +1662,19 @@ class _BookProgress extends StatelessWidget {
 // ───────────────────────── Bubble game ─────────────────────────
 
 class GamePage extends StatefulWidget {
-  const GamePage({super.key, required this.store, required this.book});
+  const GamePage({
+    super.key,
+    required this.store,
+    required this.title,
+    required this.chapters,
+    this.includeUnknown = true,
+    this.includeShowAgain = true,
+  });
   final BookStore store;
-  final BookData book;
+  final String title;
+  final List<ChapterData> chapters;
+  final bool includeUnknown;
+  final bool includeShowAgain;
 
   @override
   State<GamePage> createState() => _GamePageState();
@@ -1457,6 +1696,9 @@ class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
   bool _busy = false;
   bool _exitKnown = true;
 
+  /// Meaning stays hidden until "Show meaning" is pressed; resets per word.
+  bool _showMeaning = false;
+
   @override
   void initState() {
     super.initState();
@@ -1467,7 +1709,11 @@ class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
     _idle = AnimationController(vsync: this, duration: const Duration(seconds: 4))
       ..repeat();
 
-    _queue = widget.store.practiceWords(widget.book)..shuffle();
+    _queue = widget.store.practiceWords(
+      widget.chapters,
+      includeUnknown: widget.includeUnknown,
+      includeShowAgain: widget.includeShowAgain,
+    )..shuffle();
     _total = _queue.length;
     if (_queue.isNotEmpty) _enter.forward();
   }
@@ -1491,6 +1737,7 @@ class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
     final entry = _queue.removeAt(0);
     if (known) {
       _knownCount++;
+      // Global: the word becomes known in every book, part and chapter.
       widget.store.setWordState(entry.word, WordState.known);
     } else {
       // Unknown: clear showAgain globally and send the bubble to the end.
@@ -1501,6 +1748,7 @@ class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
 
     _enter.value = 0;
     _exit.value = 0;
+    _showMeaning = false;
     setState(() {});
     _busy = false;
     if (_queue.isNotEmpty) _enter.forward(from: 0);
@@ -1510,7 +1758,7 @@ class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.book.name,
+        title: Text(widget.title,
             style: const TextStyle(fontWeight: FontWeight.w800)),
       ),
       body: _queue.isEmpty ? _finished(context) : _playing(),
@@ -1534,7 +1782,7 @@ class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
             const SizedBox(height: 8),
             Text(
               nothing
-                  ? 'All words in this book are already known.'
+                  ? 'No words match the options you picked.'
                   : '$_knownCount words marked known'
                       '${_skips > 0 ? '  •  $_skips skipped' : ''}',
               textAlign: TextAlign.center,
@@ -1544,7 +1792,7 @@ class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
             FilledButton.icon(
               onPressed: () => Navigator.pop(context),
               icon: const Icon(Icons.arrow_back),
-              label: const Text('Back to books'),
+              label: const Text('Back'),
             ),
           ],
         ),
@@ -1667,42 +1915,71 @@ class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
           child: SafeArea(
             top: false,
             minimum: const EdgeInsets.only(bottom: 16),
-            child: Row(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                Expanded(
-                  child: SizedBox(
-                    height: 64,
-                    child: FilledButton.icon(
-                      style: FilledButton.styleFrom(
-                        backgroundColor: _red,
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(20)),
-                      ),
-                      onPressed: () => _answer(false),
-                      icon: const Icon(Icons.close_rounded, size: 28),
-                      label: const Text('Unknown',
-                          style: TextStyle(
-                              fontSize: 17, fontWeight: FontWeight.w800)),
+                SizedBox(
+                  width: double.infinity,
+                  height: 48,
+                  child: OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF356859),
+                      side: BorderSide(
+                          color: const Color(0xFF356859).withOpacity(0.5)),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16)),
+                    ),
+                    onPressed: () =>
+                        setState(() => _showMeaning = !_showMeaning),
+                    icon: Icon(_showMeaning
+                        ? Icons.visibility_off_outlined
+                        : Icons.visibility_outlined),
+                    label: Text(
+                      _showMeaning ? 'Hide meaning' : 'Show meaning',
+                      style: const TextStyle(
+                          fontSize: 15, fontWeight: FontWeight.w700),
                     ),
                   ),
                 ),
-                const SizedBox(width: 14),
-                Expanded(
-                  child: SizedBox(
-                    height: 64,
-                    child: FilledButton.icon(
-                      style: FilledButton.styleFrom(
-                        backgroundColor: _green,
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(20)),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: SizedBox(
+                        height: 64,
+                        child: FilledButton.icon(
+                          style: FilledButton.styleFrom(
+                            backgroundColor: _red,
+                            shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(20)),
+                          ),
+                          onPressed: () => _answer(false),
+                          icon: const Icon(Icons.close_rounded, size: 28),
+                          label: const Text('Unknown',
+                              style: TextStyle(
+                                  fontSize: 17, fontWeight: FontWeight.w800)),
+                        ),
                       ),
-                      onPressed: () => _answer(true),
-                      icon: const Icon(Icons.check_rounded, size: 28),
-                      label: const Text('Known',
-                          style: TextStyle(
-                              fontSize: 17, fontWeight: FontWeight.w800)),
                     ),
-                  ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: SizedBox(
+                        height: 64,
+                        child: FilledButton.icon(
+                          style: FilledButton.styleFrom(
+                            backgroundColor: _green,
+                            shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(20)),
+                          ),
+                          onPressed: () => _answer(true),
+                          icon: const Icon(Icons.check_rounded, size: 28),
+                          label: const Text('Known',
+                              style: TextStyle(
+                                  fontSize: 17, fontWeight: FontWeight.w800)),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -1772,18 +2049,20 @@ class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
                     color: _ink,
                   ),
                 ),
-                const SizedBox(height: 12),
-                Text(
-                  meaning,
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: 20,
-                    height: 1.4,
-                    color: entry.meanings.isEmpty
-                        ? Colors.black38
-                        : const Color(0xFF426B59),
+                if (_showMeaning) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    meaning,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 20,
+                      height: 1.4,
+                      color: entry.meanings.isEmpty
+                          ? Colors.black38
+                          : const Color(0xFF426B59),
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ),
