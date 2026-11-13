@@ -19,10 +19,14 @@ class ChapterPage extends StatefulWidget {
       {super.key,
       required this.store,
       required this.book,
-      required this.chapter});
+      required this.chapter,
+      this.pages = const [],
+      this.pageIndex = 0});
   final BookStore store;
   final BookData book;
   final ChapterData chapter;
+  final List<ChapterData> pages;
+  final int pageIndex;
 
   @override
   State<ChapterPage> createState() => _ChapterPageState();
@@ -32,6 +36,14 @@ class _ChapterPageState extends State<ChapterPage> {
   bool showKnown = false;
   String query = '';
   double _sliderValue = 0.0;
+
+  void _openPage(int index) {
+    if (index < 0 || index >= widget.pages.length || index == widget.pageIndex) return;
+    Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => ChapterPage(
+      store: widget.store, book: widget.book, chapter: widget.pages[index],
+      pages: widget.pages, pageIndex: index,
+    )));
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -71,6 +83,39 @@ class _ChapterPageState extends State<ChapterPage> {
             children: [
               Column(
                 children: [
+                  if (widget.chapter.imagePath != null) ...[
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(14),
+                        child: Image.file(File(widget.chapter.imagePath!), height: 230, width: double.infinity, fit: BoxFit.contain,
+                          errorBuilder: (_, __, ___) => const SizedBox(height: 80, child: Center(child: Text('Page image unavailable')))),
+                      ),
+                    ),
+                    if (widget.pages.isNotEmpty)
+                      SizedBox(
+                        height: 54,
+                        child: ListView.separated(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                          scrollDirection: Axis.horizontal,
+                          itemCount: widget.pages.length,
+                          separatorBuilder: (_, __) => const SizedBox(width: 8),
+                          itemBuilder: (context, index) => ChoiceChip(
+                            label: Text(widget.pages[index].title),
+                            selected: index == widget.pageIndex,
+                            onSelected: (_) => _openPage(index),
+                          ),
+                        ),
+                      ),
+                    if (widget.pageIndex < widget.pages.length - 1)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+                        child: Align(alignment: Alignment.centerRight,
+                          child: FilledButton.tonalIcon(
+                            onPressed: () => _openPage(widget.pageIndex + 1),
+                            icon: const Icon(Icons.arrow_forward), label: const Text('Next Page'))),
+                      ),
+                  ],
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
                     child: Column(

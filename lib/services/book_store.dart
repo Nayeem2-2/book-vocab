@@ -8,13 +8,18 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:image/image.dart' as img;
 
 import '../models/book_models.dart';
 import '../parsing/json_book_parser.dart';
+import 'dictionary_service.dart';
+import 'ocr_service.dart';
 
 class BookStore extends ChangeNotifier {
   late SharedPreferences _prefs;
   final List<BookData> books = [];
+  final DictionaryService dictionary = DictionaryService();
+  final OcrService _ocr = OcrService();
 
   /// Global word states (shared by all books). Stored in known_words.json.
   final Set<String> _known = {};
@@ -26,6 +31,9 @@ class BookStore extends ChangeNotifier {
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
     await _loadKnownWords();
+    // Warm the offline dictionary in the background on first launch. A failed
+    // download does not block the app; the Image Book screen offers retry.
+    dictionary.load().catchError((_) {});
 
     final directory = await _booksDirectory();
     final saved = _prefs.getStringList('book_records') ?? [];
@@ -34,19 +42,28 @@ class BookStore extends ChangeNotifier {
       try {
         final map = jsonDecode(record) as Map<String, dynamic>;
         final id = map['id'] as String;
-        final path = '${directory.path}/$id.json';
-        final file = File(path);
-        if (!await file.exists()) continue;
-        final raw = await file.readAsString();
-        final decoded = jsonDecode(raw);
-        final parts = JsonBookParser.parseParts(decoded);
-        books.add(BookData(
-          id: id,
-          name: (map['name'] ?? 'Untitled book').toString(),
-          fileName: (map['fileName'] ?? 'book.json').toString(),
-          parts: parts,
-          jsonPath: path,
-        ));
+        if (map['type'] == 'image') {
+          final folder = Directory('${directory.path}/$id');
+          final metadata = File('${folder.path}/book.json');
+          if (!await metadata.exists()) continue;
+          final data = jsonDecode(await metadata.readAsString()) as Map<String, dynamic>;
+          final pages = (data['pages'] as List? ?? const []).map((e) {
+            final page = e as Map<String, dynamic>;
+            return ChapterData(
+              title: (page['name'] ?? 'Page').toString(), pageRange: '',
+              imagePath: page['imagePath']?.toString(),
+              words: (page['words'] as List? ?? const []).map((w) => WordEntry.fromJson(Map<String, dynamic>.from(w))).toList(),
+            );
+          }).toList();
+          books.add(BookData(id: id, name: (map['name'] ?? 'Untitled book').toString(), fileName: '', parts: const [], jsonPath: metadata.path, isImageBook: true, pages: pages));
+        } else {
+          final path = '${directory.path}/$id.json';
+          final file = File(path);
+          if (!await file.exists()) continue;
+          final decoded = jsonDecode(await file.readAsString());
+          final parts = JsonBookParser.parseParts(decoded);
+          books.add(BookData(id: id, name: (map['name'] ?? 'Untitled book').toString(), fileName: (map['fileName'] ?? 'book.json').toString(), parts: parts, jsonPath: path));
+        }
       } catch (_) {}
     }
   }
@@ -211,11 +228,9 @@ class BookStore extends ChangeNotifier {
   Set<String> uniqueWords(BookData book) {
     return _uniqueCache.putIfAbsent(book.id, () {
       final all = <String>{};
-      for (final part in book.parts) {
-        for (final chapter in part.chapters) {
-          for (final entry in chapter.words) {
-            all.add(normalizeWord(entry.word));
-          }
+      for (final chapter in book.allChapters) {
+        for (final entry in chapter.words) {
+          all.add(normalizeWord(entry.word));
         }
       }
       return all;
@@ -346,11 +361,82 @@ class BookStore extends ChangeNotifier {
     return id;
   }
 
+  Future<BookData> createImageBook(String name) async {
+    final clean = name.trim();
+    if (clean.isEmpty) throw Exception('Please enter a book name.');
+    final id = DateTime.now().microsecondsSinceEpoch.toString();
+    final root = await _booksDirectory();
+    final folder = Directory('${root.path}/$id');
+    await Directory('${folder.path}/pages').create(recursive: true);
+    final book = BookData(id: id, name: clean, fileName: '', parts: const [], jsonPath: '${folder.path}/book.json', isImageBook: true, pages: []);
+    books.add(book);
+    await _saveImageMetadata(book);
+    await _saveBookRecords();
+    notifyListeners();
+    return book;
+  }
+
+  Future<void> _saveImageMetadata(BookData book) async {
+    final data = {'version': 1, 'name': book.name, 'pages': book.pages.map((p) => {'name': p.title, 'imagePath': p.imagePath, 'words': p.words.map((w) => w.toJson()).toList()}).toList()};
+    final file = File(book.jsonPath);
+    await file.parent.create(recursive: true);
+    await file.writeAsString(const JsonEncoder.withIndent('  ').convert(data), flush: true);
+  }
+
+  Future<void> addScannedPage(BookData book, Uint8List bytes) async {
+    if (!book.isImageBook) throw Exception('Pages can only be added to an image book.');
+    if (!dictionary.isLoaded) await dictionary.load();
+    final decoded = img.decodeImage(bytes);
+    if (decoded == null) throw Exception('This image format could not be opened.');
+    final jpg = img.encodeJpg(decoded, quality: 90);
+    var number = book.pages.length + 1;
+    final existingNames = book.pages.map((p) => p.title).toSet();
+    while (existingNames.contains('Page-$number')) { number++; }
+    final imagePath = '${File(book.jsonPath).parent.path}/pages/page_${DateTime.now().microsecondsSinceEpoch}.jpg';
+    await File(imagePath).writeAsBytes(jpg, flush: true);
+    try {
+      final words = await _ocr.extractWords(imagePath, dictionary);
+      book.pages.add(ChapterData(title: 'Page-$number', pageRange: '', words: words, imagePath: imagePath));
+      await _saveImageMetadata(book);
+      _uniqueCache.remove(book.id);
+      notifyListeners();
+    } catch (_) {
+      await File(imagePath).delete().catchError((_) => File(imagePath));
+      rethrow;
+    }
+  }
+
+  Future<void> renamePage(BookData book, ChapterData page, String name) async {
+    final clean = name.trim();
+    if (clean.isEmpty) throw Exception('Page name cannot be empty.');
+    final index = book.pages.indexOf(page);
+    if (index < 0) return;
+    book.pages[index] = ChapterData(title: clean, pageRange: '', words: page.words, imagePath: page.imagePath);
+    await _saveImageMetadata(book);
+    notifyListeners();
+  }
+
+  Future<void> deletePage(BookData book, ChapterData page) async {
+    book.pages.remove(page);
+    if (page.imagePath != null) {
+      final file = File(page.imagePath!);
+      if (await file.exists()) await file.delete();
+    }
+    await _saveImageMetadata(book);
+    _uniqueCache.remove(book.id);
+    notifyListeners();
+  }
+
   Future<void> removeBook(BookData book) async {
     books.removeWhere((b) => b.id == book.id);
     _uniqueCache.remove(book.id);
-    final file = File(book.jsonPath);
-    if (await file.exists()) await file.delete();
+    if (book.isImageBook) {
+      final folder = File(book.jsonPath).parent;
+      if (await folder.exists()) await folder.delete(recursive: true);
+    } else {
+      final file = File(book.jsonPath);
+      if (await file.exists()) await file.delete();
+    }
     await _prefs.remove('states_${book.id}');
     await _saveBookRecords();
     notifyListeners();
@@ -362,6 +448,7 @@ class BookStore extends ChangeNotifier {
               'id': b.id,
               'name': b.name,
               'fileName': b.fileName,
+              'type': b.isImageBook ? 'image' : 'json',
             }))
         .toList();
     await _prefs.setStringList('book_records', records);

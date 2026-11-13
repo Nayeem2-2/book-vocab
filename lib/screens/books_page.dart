@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../services/book_store.dart';
 import '../widgets/play_widgets.dart';
 import 'parts_page.dart';
+import 'pages_page.dart';
 
 class BooksPage extends StatelessWidget {
   const BooksPage({super.key, required this.store});
@@ -25,11 +26,28 @@ class BooksPage extends StatelessWidget {
   }
 
   Future<void> _addBook(BuildContext context) async {
-    try {
-      await store.importBook();
-    } catch (e) {
-      _msg(context, 'Could not import book: $e');
+    final choice = await showModalBottomSheet<String>(
+      context: context, showDragHandle: true,
+      builder: (context) => SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        ListTile(leading: const Icon(Icons.data_object), title: const Text('Import JSON book'), subtitle: const Text('Keep the existing Parts → Chapters structure'), onTap: () => Navigator.pop(context, 'json')),
+        ListTile(leading: const Icon(Icons.document_scanner_outlined), title: const Text('Create image book'), subtitle: const Text('Add scanned or selected page images'), onTap: () => Navigator.pop(context, 'image')),
+        const SizedBox(height: 12),
+      ])),
+    );
+    if (choice == null || !context.mounted) return;
+    if (choice == 'json') {
+      try { await store.importBook(); } catch (e) { _msg(context, 'Could not import book: $e'); }
+      return;
     }
+    final controller = TextEditingController();
+    final name = await showDialog<String>(context: context, builder: (context) => AlertDialog(
+      title: const Text('Create image book'),
+      content: TextField(controller: controller, autofocus: true, textCapitalization: TextCapitalization.sentences, decoration: const InputDecoration(labelText: 'Book name', hintText: 'e.g. English Vocabulary')),
+      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(context, controller.text), child: const Text('Create'))],
+    ));
+    controller.dispose();
+    if (name == null || name.trim().isEmpty || !context.mounted) return;
+    try { await store.createImageBook(name); } catch (e) { _msg(context, 'Could not create image book: $e'); }
   }
 
   Future<void> _exportKnown(BuildContext context) async {
@@ -60,7 +78,7 @@ class BooksPage extends StatelessWidget {
             style: TextStyle(fontWeight: FontWeight.w800)),
         actions: [
           IconButton(
-            tooltip: 'Import a JSON book',
+            tooltip: 'Add a book',
             onPressed: () => _addBook(context),
             icon: const Icon(Icons.add_circle_outline, size: 28),
           ),
@@ -127,7 +145,7 @@ class BooksPage extends StatelessWidget {
                       subtitle: Padding(
                         padding: const EdgeInsets.only(top: 6),
                         child: Text(
-                          '${book.parts.length} Parts  •  ${store.totalUniqueWords(book)} unique words\n${store.knownCount(book)} known',
+                          '${book.isImageBook ? '${book.pages.length} Pages' : '${book.parts.length} Parts'}  •  ${store.totalUniqueWords(book)} unique words\n${store.knownCount(book)} known',
                         ),
                       ),
                       isThreeLine: true,
@@ -146,8 +164,9 @@ class BooksPage extends StatelessWidget {
                       onTap: () => Navigator.push(
                         context,
                         MaterialPageRoute(
-                            builder: (_) =>
-                                PartsPage(store: store, book: book)),
+                            builder: (_) => book.isImageBook
+                                ? PagesPage(store: store, book: book)
+                                : PartsPage(store: store, book: book)),
                       ),
                     ),
                   ),
@@ -175,7 +194,7 @@ class _EmptyState extends StatelessWidget {
                   style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800)),
               const SizedBox(height: 8),
               const Text(
-                'Import a book JSON file. Each JSON will be stored as a separate book.',
+                'Add a JSON vocabulary book or create an image book from scanned pages.',
                 textAlign: TextAlign.center,
                 style: TextStyle(color: Colors.black54, height: 1.4),
               ),
@@ -183,7 +202,7 @@ class _EmptyState extends StatelessWidget {
               FilledButton.icon(
                   onPressed: onAdd,
                   icon: const Icon(Icons.upload_file),
-                  label: const Text('Import JSON')),
+                  label: const Text('Add a book')),
             ],
           ),
         ),
