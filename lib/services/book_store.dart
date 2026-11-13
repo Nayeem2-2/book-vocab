@@ -1,11 +1,9 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:image/image.dart' as img;
@@ -47,14 +45,21 @@ class BookStore extends ChangeNotifier {
           final metadata = File('${folder.path}/book.json');
           if (!await metadata.exists()) continue;
           final data = jsonDecode(await metadata.readAsString()) as Map<String, dynamic>;
-          final pages = (data['pages'] as List? ?? const []).map((e) {
-            final page = e as Map<String, dynamic>;
-            return ChapterData(
-              title: (page['name'] ?? 'Page').toString(), pageRange: '',
-              imagePath: page['imagePath']?.toString(),
-              words: (page['words'] as List? ?? const []).map((w) => WordEntry.fromJson(Map<String, dynamic>.from(w))).toList(),
-            );
-          }).toList();
+          final rawPages = data['pages'] as List? ?? const [];
+          final pages = <ChapterData>[];
+          for (var pageIndex = 0; pageIndex < rawPages.length; pageIndex++) {
+            final page = Map<String, dynamic>.from(rawPages[pageIndex] as Map);
+            final imagePath = page['imagePath']?.toString();
+            pages.add(ChapterData(
+              id: (page['id'] ?? imagePath ?? '${id}_$pageIndex').toString(),
+              title: (page['name'] ?? 'Page').toString(),
+              pageRange: '',
+              imagePath: imagePath,
+              words: (page['words'] as List? ?? const [])
+                  .map((w) => WordEntry.fromJson(Map<String, dynamic>.from(w)))
+                  .toList(),
+            ));
+          }
           books.add(BookData(id: id, name: (map['name'] ?? 'Untitled book').toString(), fileName: '', parts: const [], jsonPath: metadata.path, isImageBook: true, pages: pages));
         } else {
           final path = '${directory.path}/$id.json';
@@ -377,10 +382,24 @@ class BookStore extends ChangeNotifier {
   }
 
   Future<void> _saveImageMetadata(BookData book) async {
-    final data = {'version': 1, 'name': book.name, 'pages': book.pages.map((p) => {'name': p.title, 'imagePath': p.imagePath, 'words': p.words.map((w) => w.toJson()).toList()}).toList()};
+    final data = {
+      'version': 1,
+      'name': book.name,
+      'pages': book.pages
+          .map((page) => {
+                'id': page.stableId,
+                'name': page.title,
+                'imagePath': page.imagePath,
+                'words': page.words.map((word) => word.toJson()).toList(),
+              })
+          .toList(),
+    };
     final file = File(book.jsonPath);
     await file.parent.create(recursive: true);
-    await file.writeAsString(const JsonEncoder.withIndent('  ').convert(data), flush: true);
+    await file.writeAsString(
+      const JsonEncoder.withIndent('  ').convert(data),
+      flush: true,
+    );
   }
 
   Future<void> addScannedPage(BookData book, Uint8List bytes) async {
@@ -392,11 +411,18 @@ class BookStore extends ChangeNotifier {
     var number = book.pages.length + 1;
     final existingNames = book.pages.map((p) => p.title).toSet();
     while (existingNames.contains('Page-$number')) { number++; }
-    final imagePath = '${File(book.jsonPath).parent.path}/pages/page_${DateTime.now().microsecondsSinceEpoch}.jpg';
+    final pageId = DateTime.now().microsecondsSinceEpoch.toString();
+    final imagePath = '${File(book.jsonPath).parent.path}/pages/page_$pageId.jpg';
     await File(imagePath).writeAsBytes(jpg, flush: true);
     try {
       final words = await _ocr.extractWords(imagePath, dictionary);
-      book.pages.add(ChapterData(title: 'Page-$number', pageRange: '', words: words, imagePath: imagePath));
+      book.pages.add(ChapterData(
+        id: pageId,
+        title: 'Page-$number',
+        pageRange: '',
+        words: words,
+        imagePath: imagePath,
+      ));
       await _saveImageMetadata(book);
       _uniqueCache.remove(book.id);
       notifyListeners();
@@ -406,38 +432,90 @@ class BookStore extends ChangeNotifier {
     }
   }
 
+  Future<void> renameBook(BookData book, String name) async {
+    final clean = name.trim();
+    if (clean.isEmpty) throw Exception('Book name cannot be empty.');
+    BookData? current;
+    for (final item in books) {
+      if (item.id == book.id) {
+        current = item;
+        break;
+      }
+    }
+    if (current == null) return;
+    current.name = clean;
+    if (current.isImageBook) await _saveImageMetadata(current);
+    await _saveBookRecords();
+    notifyListeners();
+  }
+
   Future<void> renamePage(BookData book, ChapterData page, String name) async {
     final clean = name.trim();
     if (clean.isEmpty) throw Exception('Page name cannot be empty.');
-    final index = book.pages.indexOf(page);
+    final index = book.pages.indexWhere(
+      (candidate) => candidate.stableId == page.stableId,
+    );
     if (index < 0) return;
-    book.pages[index] = ChapterData(title: clean, pageRange: '', words: page.words, imagePath: page.imagePath);
+
+    // Update the existing model instead of replacing it. Existing routes,
+    // selection sets and widgets therefore keep referring to the same page.
+    book.pages[index].title = clean;
     await _saveImageMetadata(book);
+    _uniqueCache.remove(book.id);
     notifyListeners();
   }
 
   Future<void> deletePage(BookData book, ChapterData page) async {
-    book.pages.remove(page);
-    if (page.imagePath != null) {
-      final file = File(page.imagePath!);
+    await deletePages(book, [page]);
+  }
+
+  Future<void> deletePages(BookData book, Iterable<ChapterData> pagesToDelete) async {
+    final targetIds = pagesToDelete.map((page) => page.stableId).toSet();
+    if (targetIds.isEmpty) return;
+
+    final removed = book.pages
+        .where((page) => targetIds.contains(page.stableId))
+        .toList();
+    if (removed.isEmpty) return;
+
+    book.pages.removeWhere((page) => targetIds.contains(page.stableId));
+    for (final page in removed) {
+      final imagePath = page.imagePath;
+      if (imagePath == null || imagePath.isEmpty) continue;
+      final file = File(imagePath);
       if (await file.exists()) await file.delete();
     }
+
     await _saveImageMetadata(book);
     _uniqueCache.remove(book.id);
     notifyListeners();
   }
 
   Future<void> removeBook(BookData book) async {
-    books.removeWhere((b) => b.id == book.id);
-    _uniqueCache.remove(book.id);
-    if (book.isImageBook) {
-      final folder = File(book.jsonPath).parent;
-      if (await folder.exists()) await folder.delete(recursive: true);
-    } else {
-      final file = File(book.jsonPath);
-      if (await file.exists()) await file.delete();
+    await removeBooks([book]);
+  }
+
+  Future<void> removeBooks(Iterable<BookData> booksToDelete) async {
+    final targetIds = booksToDelete.map((book) => book.id).toSet();
+    if (targetIds.isEmpty) return;
+
+    final removed = books.where((book) => targetIds.contains(book.id)).toList();
+    if (removed.isEmpty) return;
+
+    books.removeWhere((book) => targetIds.contains(book.id));
+    for (final book in removed) {
+      _uniqueCache.remove(book.id);
+      if (book.isImageBook) {
+        final folder = File(book.jsonPath).parent;
+        if (await folder.exists()) await folder.delete(recursive: true);
+      } else {
+        final file = File(book.jsonPath);
+        if (await file.exists()) await file.delete();
+      }
+      // Known words are intentionally global and are not deleted with a book.
+      await _prefs.remove('states_${book.id}');
     }
-    await _prefs.remove('states_${book.id}');
+
     await _saveBookRecords();
     notifyListeners();
   }

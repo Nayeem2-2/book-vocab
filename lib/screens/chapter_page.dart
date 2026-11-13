@@ -1,18 +1,9 @@
-import 'dart:convert';
-import 'dart:io';
-import 'dart:math' as math;
-import 'dart:typed_data';
-
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/book_models.dart';
 import '../services/book_store.dart';
 import '../widgets/play_widgets.dart';
-import 'game_page.dart';
+import 'image_viewer_page.dart';
 
 class ChapterPage extends StatefulWidget {
   const ChapterPage(
@@ -37,12 +28,22 @@ class _ChapterPageState extends State<ChapterPage> {
   String query = '';
   double _sliderValue = 0.0;
 
-  void _openPage(int index) {
-    if (index < 0 || index >= widget.pages.length || index == widget.pageIndex) return;
-    Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => ChapterPage(
-      store: widget.store, book: widget.book, chapter: widget.pages[index],
-      pages: widget.pages, pageIndex: index,
-    )));
+  void _openImageViewer() {
+    final pages = widget.pages.isEmpty ? <ChapterData>[widget.chapter] : widget.pages;
+    final pageIndex = pages.indexWhere(
+      (page) => page.stableId == widget.chapter.stableId,
+    );
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        settings: RouteSettings(name: 'image-viewer:${widget.book.id}'),
+        builder: (_) => ImageViewerPage(
+          book: widget.book,
+          pages: pages,
+          initialPageIndex: pageIndex < 0 ? 0 : pageIndex,
+        ),
+      ),
+    );
   }
 
   @override
@@ -71,6 +72,12 @@ class _ChapterPageState extends State<ChapterPage> {
             title: Text(widget.chapter.title,
                 style: const TextStyle(fontWeight: FontWeight.w800)),
             actions: [
+              if (widget.chapter.imagePath != null)
+                IconButton(
+                  tooltip: 'View scanned page image',
+                  onPressed: _openImageViewer,
+                  icon: const Icon(Icons.image_outlined),
+                ),
               PlayButton(
                 store: widget.store,
                 title: widget.chapter.title,
@@ -83,39 +90,6 @@ class _ChapterPageState extends State<ChapterPage> {
             children: [
               Column(
                 children: [
-                  if (widget.chapter.imagePath != null) ...[
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(14),
-                        child: Image.file(File(widget.chapter.imagePath!), height: 230, width: double.infinity, fit: BoxFit.contain,
-                          errorBuilder: (_, __, ___) => const SizedBox(height: 80, child: Center(child: Text('Page image unavailable')))),
-                      ),
-                    ),
-                    if (widget.pages.isNotEmpty)
-                      SizedBox(
-                        height: 54,
-                        child: ListView.separated(
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                          scrollDirection: Axis.horizontal,
-                          itemCount: widget.pages.length,
-                          separatorBuilder: (_, __) => const SizedBox(width: 8),
-                          itemBuilder: (context, index) => ChoiceChip(
-                            label: Text(widget.pages[index].title),
-                            selected: index == widget.pageIndex,
-                            onSelected: (_) => _openPage(index),
-                          ),
-                        ),
-                      ),
-                    if (widget.pageIndex < widget.pages.length - 1)
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
-                        child: Align(alignment: Alignment.centerRight,
-                          child: FilledButton.tonalIcon(
-                            onPressed: () => _openPage(widget.pageIndex + 1),
-                            icon: const Icon(Icons.arrow_forward), label: const Text('Next Page'))),
-                      ),
-                  ],
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
                     child: Column(
