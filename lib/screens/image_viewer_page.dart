@@ -4,8 +4,8 @@ import 'package:flutter/material.dart';
 
 import '../models/book_models.dart';
 
-/// Full-screen image viewer for image-book pages.
-/// The page list is passed in the same alphabetic order as the Pages screen.
+/// Full-screen image viewer. Its page sequence is inherited from the active
+/// vocabulary navigation mode (alphabetical or original scan/import order).
 class ImageViewerPage extends StatefulWidget {
   const ImageViewerPage({
     super.key,
@@ -46,10 +46,8 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
     setState(() => _currentIndex++);
   }
 
-  void _minimizeToPages() {
-    Navigator.of(context).popUntil(
-      (route) => route.settings.name == 'pages:${widget.book.id}',
-    );
+  void _minimizeToVocabulary() {
+    Navigator.of(context).pop(_currentPage?.stableId);
   }
 
   @override
@@ -68,23 +66,28 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
           style: const TextStyle(fontWeight: FontWeight.w700),
         ),
         leading: IconButton(
-          tooltip: 'Minimize to pages',
-          onPressed: _minimizeToPages,
+          tooltip: 'Minimize to vocabulary',
+          onPressed: _minimizeToVocabulary,
           icon: const Icon(Icons.minimize_rounded),
         ),
         actions: const [],
       ),
       body: page == null
           ? const Center(
-              child: Text('No page image available', style: TextStyle(color: Colors.white70)),
+              child: Text(
+                'No page image available',
+                style: TextStyle(color: Colors.white70),
+              ),
             )
           : LayoutBuilder(
               builder: (context, constraints) {
-                final currentPage = page!;
-                final imagePath = currentPage.imagePath;
+                final imagePath = page.imagePath;
                 if (imagePath == null || imagePath.isEmpty) {
                   return const Center(
-                    child: Text('Page image unavailable', style: TextStyle(color: Colors.white70)),
+                    child: Text(
+                      'Page image unavailable',
+                      style: TextStyle(color: Colors.white70),
+                    ),
                   );
                 }
 
@@ -93,7 +96,7 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
                     Positioned.fill(
                       child: Center(
                         child: InteractiveViewer(
-                          key: ValueKey(currentPage.stableId),
+                          key: ValueKey(page.stableId),
                           minScale: 1,
                           maxScale: 6,
                           panEnabled: true,
@@ -167,7 +170,11 @@ class _NavigationButton extends StatelessWidget {
       child: IconButton(
         tooltip: tooltip,
         onPressed: enabled ? onPressed : null,
-        icon: Icon(icon, size: 30, color: enabled ? const Color(0xFF24352C) : Colors.black38),
+        icon: Icon(
+          icon,
+          size: 30,
+          color: enabled ? const Color(0xFF24352C) : Colors.black38,
+        ),
       ),
     );
   }

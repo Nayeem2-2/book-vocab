@@ -91,8 +91,11 @@ class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
       // Global: the word becomes known in every book, part and chapter.
       widget.store.setWordState(entry.word, WordState.known);
     } else {
-      // Unknown: clear showAgain globally and send the bubble to the end.
-      widget.store.setWordState(entry.word, WordState.unknown);
+      // An Unknown answer skips the word, but it must not erase an existing
+      // Show Again flag. Ordinary Unknown words remain Unknown.
+      if (widget.store.getWordState(entry.word) != WordState.showAgain) {
+        widget.store.setWordState(entry.word, WordState.unknown);
+      }
       _queue.add(entry);
       _skips++;
     }

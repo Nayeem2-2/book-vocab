@@ -1,11 +1,8 @@
-import 'dart:io';
-
-import 'package:cunning_document_scanner/cunning_document_scanner.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../models/book_models.dart';
 import '../services/book_store.dart';
+import '../services/image_page_importer.dart';
 import '../widgets/alphabet_fast_scroller.dart';
 import '../widgets/name_input_dialog.dart';
 import '../widgets/play_widgets.dart';
@@ -56,60 +53,15 @@ class _PagesPageState extends State<PagesPage> {
   }
 
   Future<void> _addPage() async {
-    final choice = await showModalBottomSheet<String>(
-      context: context,
-      showDragHandle: true,
-      builder: (context) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                leading: const Icon(Icons.document_scanner_outlined),
-                title: const Text('Camera'),
-                onTap: () => Navigator.pop(context, 'camera'),
-              ),
-              ListTile(
-                leading: const Icon(Icons.image_outlined),
-                title: const Text('Pick image file'),
-                onTap: () => Navigator.pop(context, 'file'),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-    if (!mounted || choice == null) return;
-
     setState(() => busy = true);
     try {
-      if (choice == 'camera') {
-        final result = await CunningDocumentScanner.scanDocuments();
-        final paths = result?.images ?? const <String>[];
-        for (final path in paths) {
-          await widget.store.addScannedPage(widget.book, await File(path).readAsBytes());
-        }
-        if (paths.isNotEmpty) _message('${paths.length} page(s) scanned and processed.');
-      } else {
-        final result = await FilePicker.platform.pickFiles(
-          type: FileType.custom,
-          allowedExtensions: ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'tif', 'tiff'],
-          allowMultiple: true,
-          withData: true,
-        );
-        if (result != null) {
-          var added = 0;
-          for (final picked in result.files) {
-            final bytes = picked.bytes ??
-                (picked.path == null ? null : await File(picked.path!).readAsBytes());
-            if (bytes != null) {
-              await widget.store.addScannedPage(widget.book, bytes);
-              added++;
-            }
-          }
-          if (added > 0) _message('$added image(s) added.');
-        }
+      final added = await addImagePagesFromSource(
+        context: context,
+        store: widget.store,
+        book: widget.book,
+      );
+      if (added.isNotEmpty) {
+        _message('${added.length} page(s) added and processed.');
       }
     } catch (error) {
       _message('Could not add page: $error');
@@ -255,6 +207,44 @@ class _PagesPageState extends State<PagesPage> {
     );
   }
 
+  Map<String, List<ChapterData>> _groupPagesByInitial(
+    List<ChapterData> pages,
+  ) {
+    final groups = <String, List<ChapterData>>{};
+    for (final page in pages) {
+      final trimmed = page.title.trim();
+      final initial = trimmed.isEmpty ? '#' : trimmed[0].toUpperCase();
+      final letter = RegExp(r'^[A-Z]$').hasMatch(initial) ? initial : '#';
+      groups.putIfAbsent(letter, () => <ChapterData>[]).add(page);
+    }
+    return groups;
+  }
+
+  Widget _letterHeader(String letter) {
+    return SizedBox(
+      height: 32,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 6, 12, 2),
+        child: Row(
+          children: [
+            Text(
+              letter,
+              style: const TextStyle(
+                color: Color(0xFF356859),
+                fontSize: 13,
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Divider(color: const Color(0xFF356859).withOpacity(0.18)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _pageTile(ChapterData page, List<ChapterData> orderedPages) {
     final selected = _selectedPageIds.contains(page.stableId);
     return SizedBox(
@@ -339,14 +329,33 @@ class _PagesPageState extends State<PagesPage> {
     return AnimatedBuilder(
       animation: widget.store,
       builder: (context, _) {
-        // Keep image navigation in original scan/import order. The visible
-        // directory is alphabetically sorted separately for A–Z browsing.
-        final readingOrderPages = List<ChapterData>.from(widget.book.pages);
+        // The Pages directory and navigation entered from it are alphabetical.
+        // The BookData.pages list itself remains untouched in scan/import order.
+        final alphabeticalPages = List<ChapterData>.from(widget.book.pages)
+          ..sort((a, b) => a.title.trim().toLowerCase().compareTo(
+                b.title.trim().toLowerCase(),
+              ));
         final visiblePages = rankAndSortByName<ChapterData>(
           widget.book.pages,
           (page) => page.title,
           _query,
         );
+        final groupedPages = _groupPagesByInitial(visiblePages);
+        final rows = <Object>[];
+        final sectionOffsets = <String, double>{};
+        var contentOffset = 0.0;
+        for (final group in groupedPages.entries) {
+          sectionOffsets[group.key] = contentOffset;
+          rows.add(group.key);
+          contentOffset += 32;
+          for (final page in group.value) {
+            rows.add(page);
+            contentOffset += 88;
+          }
+        }
+        final indexLetters = groupedPages.keys
+            .where((letter) => RegExp(r'^[A-Z]$').hasMatch(letter))
+            .toList();
 
         return Scaffold(
           appBar: AppBar(
@@ -376,14 +385,7 @@ class _PagesPageState extends State<PagesPage> {
                     ),
                     const SizedBox(width: 6),
                   ]
-                : [
-                    PlayButton(
-                      store: widget.store,
-                      title: widget.book.name,
-                      chapters: widget.book.pages,
-                    ),
-                    const SizedBox(width: 8),
-                  ],
+                : [],
           ),
           floatingActionButton: _selectionMode
               ? null
@@ -449,22 +451,45 @@ class _PagesPageState extends State<PagesPage> {
                                 child: ListView.builder(
                                   controller: _scrollController,
                                   padding: const EdgeInsets.fromLTRB(12, 0, 27, 100),
-                                  itemExtent: 88,
-                                  itemCount: visiblePages.length,
-                                  itemBuilder: (context, index) =>
-                                      _pageTile(visiblePages[index], readingOrderPages),
+                                  itemCount: rows.length,
+                                  itemBuilder: (context, index) {
+                                    final row = rows[index];
+                                    return row is String
+                                        ? _letterHeader(row)
+                                        : _pageTile(
+                                            row as ChapterData,
+                                            alphabeticalPages,
+                                          );
+                                  },
                                 ),
                               ),
-                              Positioned(
-                                right: 1,
-                                top: 4,
-                                bottom: 8,
-                                child: AlphabetFastScroller(
-                                  controller: _scrollController,
-                                  names: visiblePages.map((page) => page.title).toList(),
-                                  itemExtent: 88,
+                              if (indexLetters.isNotEmpty)
+                                Positioned(
+                                  right: 1,
+                                  top: 4,
+                                  bottom: 104,
+                                  child: AlphabetFastScroller(
+                                    controller: _scrollController,
+                                    names: indexLetters,
+                                    itemExtent: 0,
+                                    onLetterSelected: (letter) {
+                                      final target = sectionOffsets[letter];
+                                      if (target == null ||
+                                          !_scrollController.hasClients) {
+                                        return;
+                                      }
+                                      _scrollController.animateTo(
+                                        target.clamp(
+                                          0.0,
+                                          _scrollController.position.maxScrollExtent,
+                                        ).toDouble(),
+                                        duration:
+                                            const Duration(milliseconds: 110),
+                                        curve: Curves.easeOutCubic,
+                                      );
+                                    },
+                                  ),
                                 ),
-                              ),
                             ],
                           ),
               ),

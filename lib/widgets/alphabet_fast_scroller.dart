@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 
 /// Filters and sorts names with exact matches first, then prefix matches,
-/// followed by substring matches. Every group is alphabetically ordered.
+/// followed by substring matches. Results within each relevance group are
+/// alphabetically ordered.
 List<T> rankAndSortByName<T>(
   Iterable<T> values,
   String Function(T value) nameOf,
@@ -31,20 +32,26 @@ List<T> rankAndSortByName<T>(
   return result;
 }
 
-/// A compact A–Z rail that jumps through a sorted list by initial letter.
-/// It is deliberately separate from Flutter's ordinary scrollbar: the user
-/// drags the alphabet itself, like the fast index in Android contacts apps.
+/// Alphabetical fast-scroll rail used by Books, Pages and page vocabulary.
+///
+/// The rail stays subtly visible when idle. During touch/drag it becomes fully
+/// visible and displays a five-letter focal preview around the active letter.
+/// For regular lists [itemExtent] maps an alphabet position to a row offset.
+/// For grouped/variable-height lists, supply [onLetterSelected] and scroll to
+/// the matching section yourself (for example with Scrollable.ensureVisible).
 class AlphabetFastScroller extends StatefulWidget {
   const AlphabetFastScroller({
     super.key,
     required this.controller,
     required this.names,
     required this.itemExtent,
+    this.onLetterSelected,
   });
 
   final ScrollController controller;
   final List<String> names;
   final double itemExtent;
+  final ValueChanged<String>? onLetterSelected;
 
   @override
   State<AlphabetFastScroller> createState() => _AlphabetFastScrollerState();
@@ -52,63 +59,79 @@ class AlphabetFastScroller extends StatefulWidget {
 
 class _AlphabetFastScrollerState extends State<AlphabetFastScroller> {
   static const String _alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  String? _activeLetter;
+
+  bool _interacting = false;
+  int? _activeIndex;
   double _activeY = 0;
 
-  void _jumpTo(double localY, double railHeight) {
-    if (widget.names.isEmpty || !widget.controller.hasClients || railHeight <= 0) {
-      return;
-    }
+  int? _findNearestAvailableIndex(int requestedIndex) {
+    if (widget.names.isEmpty) return null;
 
-    final fraction = (localY / railHeight).clamp(0.0, 0.999999);
-    final letterIndex = (fraction * _alphabet.length).floor();
-    final letter = _alphabet[letterIndex];
+    var forwardIndex = -1;
+    var forwardGap = 27;
+    var backwardIndex = -1;
+    var backwardGap = 27;
 
-    var targetIndex = -1;
-    var smallestForwardGap = 27;
-    var closestEarlierLetter = -1;
-    var smallestBackwardGap = 27;
-
-    // Search results can be grouped by relevance (prefix matches first), so
-    // locate the nearest available initial rather than assuming the whole
-    // filtered result is globally alphabetical.
     for (var i = 0; i < widget.names.length; i++) {
       final name = widget.names[i].trim();
       if (name.isEmpty) continue;
       final initial = name[0].toUpperCase();
-      final letterPosition = _alphabet.indexOf(initial);
-      if (letterPosition < 0) continue;
+      final letterIndex = _alphabet.indexOf(initial);
+      if (letterIndex < 0) continue;
 
-      final gap = letterPosition - letterIndex;
-      if (gap >= 0 && gap < smallestForwardGap) {
-        smallestForwardGap = gap;
-        targetIndex = i;
-      } else if (gap < 0 && -gap < smallestBackwardGap) {
-        smallestBackwardGap = -gap;
-        closestEarlierLetter = i;
+      final gap = letterIndex - requestedIndex;
+      if (gap >= 0 && gap < forwardGap) {
+        forwardGap = gap;
+        forwardIndex = i;
+      } else if (gap < 0 && -gap < backwardGap) {
+        backwardGap = -gap;
+        backwardIndex = i;
       }
     }
 
-    if (targetIndex < 0) {
-      targetIndex = closestEarlierLetter >= 0 ? closestEarlierLetter : 0;
+    if (forwardIndex < 0) return backwardIndex < 0 ? null : backwardIndex;
+    if (backwardIndex < 0) return forwardIndex;
+    return forwardGap <= backwardGap ? forwardIndex : backwardIndex;
+  }
+
+  void _moveTo(double localY, double railHeight) {
+    if (widget.names.isEmpty || railHeight <= 0) return;
+
+    final normalized = (localY / railHeight).clamp(0.0, 0.999999);
+    final requestedIndex = (normalized * _alphabet.length).floor();
+    final nearestIndex = _findNearestAvailableIndex(requestedIndex);
+
+    setState(() {
+      _interacting = true;
+      _activeIndex = requestedIndex;
+      _activeY = localY.clamp(0.0, railHeight - 1).toDouble();
+    });
+
+    if (nearestIndex == null) return;
+
+    final selectedName = widget.names[nearestIndex].trim();
+    if (selectedName.isEmpty) return;
+    final selectedLetter = selectedName[0].toUpperCase();
+
+    if (widget.onLetterSelected != null) {
+      widget.onLetterSelected!(selectedLetter);
+      return;
     }
 
+    if (!widget.controller.hasClients || widget.itemExtent <= 0) return;
     final position = widget.controller.position;
-    final offset = (targetIndex * widget.itemExtent)
+    final offset = (nearestIndex * widget.itemExtent)
         .clamp(0.0, position.maxScrollExtent)
         .toDouble();
     widget.controller.jumpTo(offset);
-
-    setState(() {
-      _activeLetter = letter;
-      _activeY = localY.clamp(0.0, railHeight - 1).toDouble();
-    });
   }
 
-  void _hideBubble() {
-    if (_activeLetter != null && mounted) {
-      setState(() => _activeLetter = null);
-    }
+  void _finishInteraction() {
+    if (!mounted || !_interacting) return;
+    setState(() {
+      _interacting = false;
+      _activeIndex = null;
+    });
   }
 
   @override
@@ -118,68 +141,122 @@ class _AlphabetFastScrollerState extends State<AlphabetFastScroller> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final height = constraints.maxHeight;
-        final bubbleTop = (_activeY - 22)
-            .clamp(0.0, (height - 44).clamp(0.0, height).toDouble())
+        if (height <= 0) return const SizedBox.shrink();
+
+        final activeIndex = _activeIndex ?? 0;
+        final bubbleHeight = 126.0;
+        final bubbleTop = (_activeY - bubbleHeight / 2)
+            .clamp(0.0, (height - bubbleHeight).clamp(0.0, height).toDouble())
             .toDouble();
+
         return Stack(
           clipBehavior: Clip.none,
           children: [
             GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTapDown: (details) =>
-                  _jumpTo(details.localPosition.dy, height),
+              onTapDown: (details) => _moveTo(details.localPosition.dy, height),
+              onTapUp: (_) => _finishInteraction(),
+              onTapCancel: _finishInteraction,
               onVerticalDragStart: (details) =>
-                  _jumpTo(details.localPosition.dy, height),
+                  _moveTo(details.localPosition.dy, height),
               onVerticalDragUpdate: (details) =>
-                  _jumpTo(details.localPosition.dy, height),
-              onVerticalDragEnd: (_) => _hideBubble(),
-              onTapUp: (_) => _hideBubble(),
-              child: SizedBox(
-                width: 28,
-                height: height,
-                child: Column(
-                  children: List.generate(
-                    _alphabet.length,
-                    (index) => Expanded(
-                      child: Center(
-                        child: Text(
-                          _alphabet[index],
-                          style: TextStyle(
-                            fontSize: 10,
-                            height: 1,
-                            fontWeight: FontWeight.w700,
-                            color: Theme.of(context)
-                                .colorScheme
-                                .onSurfaceVariant,
+                  _moveTo(details.localPosition.dy, height),
+              onVerticalDragEnd: (_) => _finishInteraction(),
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 160),
+                opacity: _interacting ? 1.0 : 0.30,
+                child: SizedBox(
+                  width: 26,
+                  height: height,
+                  child: Column(
+                    children: List.generate(
+                      _alphabet.length,
+                      (index) {
+                        final isActive = _interacting && index == _activeIndex;
+                        return Expanded(
+                          child: Center(
+                            child: AnimatedDefaultTextStyle(
+                              duration: const Duration(milliseconds: 100),
+                              style: TextStyle(
+                                fontSize: isActive ? 13 : 9.5,
+                                height: 1,
+                                fontWeight: FontWeight.w800,
+                                color: isActive
+                                    ? Theme.of(context).colorScheme.primary
+                                    : Theme.of(context)
+                                        .colorScheme
+                                        .onSurfaceVariant,
+                              ),
+                              child: Text(_alphabet[index]),
+                            ),
                           ),
-                        ),
-                      ),
+                        );
+                      },
                     ),
                   ),
                 ),
               ),
             ),
-            if (_activeLetter != null)
+            if (_interacting && _activeIndex != null)
               Positioned(
                 right: 30,
                 top: bubbleTop,
                 child: IgnorePointer(
                   child: Material(
-                    elevation: 5,
-                    color: Theme.of(context).colorScheme.primary,
-                    shape: const CircleBorder(),
-                    child: SizedBox(
-                      width: 44,
-                      height: 44,
-                      child: Center(
-                        child: Text(
-                          _activeLetter!,
-                          style: TextStyle(
-                            color: Theme.of(context).colorScheme.onPrimary,
-                            fontSize: 20,
-                            fontWeight: FontWeight.w800,
-                          ),
+                    elevation: 7,
+                    color: Colors.transparent,
+                    borderRadius: BorderRadius.circular(24),
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 120),
+                      curve: Curves.easeOutCubic,
+                      width: 62,
+                      height: bubbleHeight,
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surface,
+                        borderRadius: BorderRadius.circular(24),
+                        border: Border.all(
+                          color: Theme.of(context)
+                              .colorScheme
+                              .primary
+                              .withOpacity(0.18),
                         ),
+                      ),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: List.generate(5, (position) {
+                          final distance = position - 2;
+                          final letterIndex = activeIndex + distance;
+                          final inRange =
+                              letterIndex >= 0 && letterIndex < _alphabet.length;
+                          final isCurrent = distance == 0;
+                          final sizes = [10.0, 15.0, 29.0, 15.0, 10.0];
+                          final opacities = [0.28, 0.55, 1.0, 0.55, 0.28];
+
+                          return SizedBox(
+                            height: 23,
+                            child: Center(
+                              child: AnimatedDefaultTextStyle(
+                                duration: const Duration(milliseconds: 100),
+                                style: TextStyle(
+                                  fontSize: sizes[position],
+                                  height: 1,
+                                  fontWeight: isCurrent
+                                      ? FontWeight.w900
+                                      : FontWeight.w700,
+                                  color: isCurrent
+                                      ? Theme.of(context).colorScheme.primary
+                                      : Theme.of(context)
+                                          .colorScheme
+                                          .onSurface
+                                          .withOpacity(opacities[position]),
+                                ),
+                                child: Text(
+                                  inRange ? _alphabet[letterIndex] : ' ',
+                                ),
+                              ),
+                            ),
+                          );
+                        }),
                       ),
                     ),
                   ),

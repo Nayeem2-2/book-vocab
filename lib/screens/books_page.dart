@@ -328,6 +328,42 @@ class _BooksPageState extends State<BooksPage> {
     );
   }
 
+  Map<String, List<BookData>> _groupBooksByInitial(List<BookData> books) {
+    final groups = <String, List<BookData>>{};
+    for (final book in books) {
+      final trimmed = book.name.trim();
+      final initial = trimmed.isEmpty ? '#' : trimmed[0].toUpperCase();
+      final letter = RegExp(r'^[A-Z]$').hasMatch(initial) ? initial : '#';
+      groups.putIfAbsent(letter, () => <BookData>[]).add(book);
+    }
+    return groups;
+  }
+
+  Widget _letterHeader(String letter) {
+    return SizedBox(
+      height: 36,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 7, 12, 3),
+        child: Row(
+          children: [
+            Text(
+              letter,
+              style: const TextStyle(
+                color: Color(0xFF356859),
+                fontSize: 14,
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Divider(color: const Color(0xFF356859).withOpacity(0.18)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _emptyState({required bool noSearchMatches}) {
     if (noSearchMatches) {
       return const Center(child: Text('No books match your search.'));
@@ -345,6 +381,22 @@ class _BooksPageState extends State<BooksPage> {
           (book) => book.name,
           _query,
         );
+        final groupedBooks = _groupBooksByInitial(filteredBooks);
+        final rows = <Object>[];
+        final sectionOffsets = <String, double>{};
+        var contentOffset = 0.0;
+        for (final group in groupedBooks.entries) {
+          sectionOffsets[group.key] = contentOffset;
+          rows.add(group.key);
+          contentOffset += 36;
+          for (final book in group.value) {
+            rows.add(book);
+            contentOffset += 112;
+          }
+        }
+        final indexLetters = groupedBooks.keys
+            .where((letter) => RegExp(r'^[A-Z]$').hasMatch(letter))
+            .toList();
 
         return Scaffold(
           appBar: AppBar(
@@ -428,21 +480,40 @@ class _BooksPageState extends State<BooksPage> {
                             child: ListView.builder(
                               controller: _scrollController,
                               padding: const EdgeInsets.fromLTRB(12, 0, 27, 100),
-                              itemExtent: 112,
-                              itemCount: filteredBooks.length,
-                              itemBuilder: (context, index) => _bookTile(filteredBooks[index]),
+                              itemCount: rows.length,
+                              itemBuilder: (context, index) {
+                                final row = rows[index];
+                                return row is String
+                                    ? _letterHeader(row)
+                                    : _bookTile(row as BookData);
+                              },
                             ),
                           ),
-                          Positioned(
-                            right: 1,
-                            top: 4,
-                            bottom: 104,
-                            child: AlphabetFastScroller(
-                              controller: _scrollController,
-                              names: filteredBooks.map((book) => book.name).toList(),
-                              itemExtent: 112,
+                          if (indexLetters.isNotEmpty)
+                            Positioned(
+                              right: 1,
+                              top: 4,
+                              bottom: 104,
+                              child: AlphabetFastScroller(
+                                controller: _scrollController,
+                                names: indexLetters,
+                                itemExtent: 0,
+                                onLetterSelected: (letter) {
+                                  final target = sectionOffsets[letter];
+                                  if (target == null || !_scrollController.hasClients) {
+                                    return;
+                                  }
+                                  _scrollController.animateTo(
+                                    target.clamp(
+                                      0.0,
+                                      _scrollController.position.maxScrollExtent,
+                                    ).toDouble(),
+                                    duration: const Duration(milliseconds: 110),
+                                    curve: Curves.easeOutCubic,
+                                  );
+                                },
+                              ),
                             ),
-                          ),
                         ],
                       ),
               ),
