@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
@@ -24,14 +25,30 @@ class BookStore extends ChangeNotifier {
   final Set<String> _showAgain = {};
 
   final Map<String, Set<String>> _uniqueCache = {};
+  final Map<String, int> _knownCountCache = {};
+  final Map<String, int> _showAgainCountCache = {};
+  final Map<String, Future<void>> _bookWordCacheFutures = {};
+  final Map<String, int> _bookWordCacheGenerations = {};
+
+  // Word-state updates are intentionally separate from structural store
+  // notifications. A single status tap must not rebuild Books/Pages/App bars.
+  final ValueNotifier<int> wordStateRevision = ValueNotifier<int>(0);
+  final Map<String, _WordStateSignal> _wordStateSignals = {};
+  static const int _maxWordStateSignals = 512;
+  final Map<String, _PracticeScopeCache> _practiceScopeCache = {};
+  static const int _maxPracticeScopeCaches = 8;
+
   Future<void> _saveChain = Future.value();
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
     await _loadKnownWords();
-    // Warm the offline dictionary in the background on first launch. A failed
-    // download does not block the app; the Image Book screen offers retry.
-    dictionary.load().catchError((_) {});
+    // Load the dictionary directly from the bundled application asset.
+    // Loading happens asynchronously; JSON parsing runs in a background
+    // isolate so it does not block scrolling or other UI work.
+    dictionary.load().catchError((error) {
+      debugPrint('Bundled dictionary could not be loaded: $error');
+    });
 
     final directory = await _booksDirectory();
     final saved = _prefs.getStringList('book_records') ?? [];
@@ -207,7 +224,8 @@ class BookStore extends ChangeNotifier {
     }
     final decoded = jsonDecode(utf8.decode(bytes));
     final added = _mergeJson(decoded);
-    notifyListeners();
+    _refreshCachedWordCounts();
+    wordStateRevision.value++;
     await _saveKnownWords();
     return added;
   }
@@ -230,44 +248,358 @@ class BookStore extends ChangeNotifier {
     return WordState.unknown;
   }
 
-  Set<String> uniqueWords(BookData book) {
-    return _uniqueCache.putIfAbsent(book.id, () {
-      final all = <String>{};
-      for (final chapter in book.allChapters) {
-        for (final entry in chapter.words) {
-          all.add(normalizeWord(entry.word));
+  ValueListenable<WordState> wordStateListenable(String word) {
+    final key = normalizeWord(word);
+    final existing = _wordStateSignals.remove(key);
+    if (existing != null) {
+      // Map insertion order is a small LRU. Reusing a recently detached signal
+      // also avoids rebuilding it during a list child's dispose/update cycle.
+      _wordStateSignals[key] = existing;
+      return existing;
+    }
+
+    final signal = _WordStateSignal(
+      getWordState(key),
+      onNoListeners: _trimWordStateSignals,
+    );
+    _wordStateSignals[key] = signal;
+    _trimWordStateSignals();
+    return signal;
+  }
+
+  void _trimWordStateSignals() {
+    while (_wordStateSignals.length > _maxWordStateSignals) {
+      String? removableKey;
+      for (final entry in _wordStateSignals.entries) {
+        if (entry.value.listenerCount == 0) {
+          removableKey = entry.key;
+          break;
         }
       }
-      return all;
+      if (removableKey == null) return;
+      _wordStateSignals.remove(removableKey)?.dispose();
+    }
+  }
+
+  Set<String> uniqueWords(BookData book) {
+    final cached = _uniqueCache[book.id];
+    if (cached != null) return cached;
+
+    // Synchronous fallback for small, immediate operations such as starting a
+    // game. Library widgets use ensureBookWordCache() so a large book is never
+    // scanned as part of a scrolling frame.
+    final all = <String>{};
+    for (final chapter in book.allChapters) {
+      for (final entry in chapter.words) {
+        final key = normalizeWord(entry.word);
+        if (key.isNotEmpty) all.add(key);
+      }
+    }
+    _installBookWordCache(book, all);
+    return all;
+  }
+
+  /// Builds the whole-book vocabulary index cooperatively. Work is split into
+  /// small chunks so opening/scrolling library screens doesn't spend a long
+  /// uninterrupted frame scanning every word in a multi-thousand-page book.
+  /// Concurrent widgets share the same Future.
+  Future<void> ensureBookWordCache(BookData book) {
+    final existing = _bookWordCacheFutures[book.id];
+    if (existing != null) return existing;
+    if (_uniqueCache.containsKey(book.id)) {
+      return _bookWordCacheFutures.putIfAbsent(
+        book.id,
+        () => Future<void>.value(),
+      );
+    }
+
+    final generation = _bookWordCacheGenerations[book.id] ?? 0;
+    late final Future<void> future;
+    future = _buildBookWordCache(book, generation).catchError((Object error) {
+      if (identical(_bookWordCacheFutures[book.id], future)) {
+        _bookWordCacheFutures.remove(book.id);
+      }
+      throw error;
     });
+    _bookWordCacheFutures[book.id] = future;
+    return future;
+  }
+
+  Future<void> _buildBookWordCache(BookData book, int generation) async {
+    final all = <String>{};
+    var known = 0;
+    var again = 0;
+    var processed = 0;
+    final stateRevisionAtStart = wordStateRevision.value;
+    final chapters = book.allChapters;
+
+    for (final chapter in chapters) {
+      for (final entry in chapter.words) {
+        final key = normalizeWord(entry.word);
+        if (key.isNotEmpty && all.add(key)) {
+          final state = getWordState(key);
+          if (state == WordState.known) {
+            known++;
+          } else if (state == WordState.showAgain) {
+            again++;
+          }
+        }
+        processed++;
+        if (processed % 600 == 0) {
+          await Future<void>.delayed(Duration.zero);
+          if ((_bookWordCacheGenerations[book.id] ?? 0) != generation ||
+              !books.any((item) => item.id == book.id)) {
+            return;
+          }
+        }
+      }
+    }
+
+    if ((_bookWordCacheGenerations[book.id] ?? 0) != generation ||
+        !books.any((item) => item.id == book.id)) {
+      return;
+    }
+
+    // A user may mark words while the cache is being warmed. Recount against
+    // the final state revision, yielding between chunks if the dataset is big.
+    if (stateRevisionAtStart != wordStateRevision.value) {
+      while (true) {
+        final revision = wordStateRevision.value;
+        known = 0;
+        again = 0;
+        var counted = 0;
+        for (final key in all) {
+          final state = getWordState(key);
+          if (state == WordState.known) {
+            known++;
+          } else if (state == WordState.showAgain) {
+            again++;
+          }
+          counted++;
+          if (counted % 600 == 0) {
+            await Future<void>.delayed(Duration.zero);
+            if ((_bookWordCacheGenerations[book.id] ?? 0) != generation) {
+              return;
+            }
+          }
+        }
+        if (revision == wordStateRevision.value) break;
+      }
+    }
+
+    if ((_bookWordCacheGenerations[book.id] ?? 0) != generation) return;
+    _installBookWordCache(book, all, known: known, showAgain: again);
+  }
+
+  void _installBookWordCache(
+    BookData book,
+    Set<String> all, {
+    int? known,
+    int? showAgain,
+  }) {
+    // Book-level membership is checked against the small set of cached books
+    // when a state changes. This avoids retaining a second, high-overhead
+    // word→book reverse index for hundreds of thousands of distinct words.
+    _invalidateBookWordCache(book.id, bumpGeneration: false);
+    _uniqueCache[book.id] = all;
+    // Work with non-null local counters. The optional parameters remain
+    // nullable by contract, so incrementing them directly is not valid under
+    // Dart's null-safety rules.
+    var knownCount = known ?? 0;
+    var showAgainCount = showAgain ?? 0;
+    if (known == null || showAgain == null) {
+      knownCount = 0;
+      showAgainCount = 0;
+      for (final key in all) {
+        final state = getWordState(key);
+        if (state == WordState.known) {
+          knownCount++;
+        } else if (state == WordState.showAgain) {
+          showAgainCount++;
+        }
+      }
+    }
+    _knownCountCache[book.id] = knownCount;
+    _showAgainCountCache[book.id] = showAgainCount;
+  }
+
+  bool hasBookWordCache(BookData book) => _uniqueCache.containsKey(book.id);
+
+  PracticeCounts? cachedPracticeCountsForBook(BookData book) {
+    final words = _uniqueCache[book.id];
+    if (words == null) return null;
+    return PracticeCounts(
+      words.length - (_knownCountCache[book.id] ?? 0) -
+          (_showAgainCountCache[book.id] ?? 0),
+      _showAgainCountCache[book.id] ?? 0,
+    );
   }
 
   int totalUniqueWords(BookData book) => uniqueWords(book).length;
 
-  int knownCount(BookData book) =>
-      uniqueWords(book).where(_known.contains).length;
+  int knownCount(BookData book) {
+    uniqueWords(book);
+    return _knownCountCache[book.id] ?? 0;
+  }
 
-  /// Distinct words in the given chapters that are unknown / show again.
-  /// Known words are never counted. Words are global, so a word that is
-  /// known anywhere is known everywhere.
-  PracticeCounts practiceCounts(List<ChapterData> chapters) {
-    final seen = <String>{};
+  /// O(1) aggregate counts for a whole book. This avoids retaining a second
+  /// giant word set in the page-scope LRU just to enable the book Play button.
+  PracticeCounts practiceCountsForBook(BookData book) {
+    final words = uniqueWords(book);
+    final known = _knownCountCache[book.id] ?? 0;
+    final again = _showAgainCountCache[book.id] ?? 0;
+    return PracticeCounts(words.length - known - again, again);
+  }
+
+  String _practiceScopeKey(List<ChapterData> chapters) {
+    if (chapters.length == 1) {
+      return 'chapter:${identityHashCode(chapters.single)}';
+    }
+    // Multi-chapter callers pass the stable PartData.chapters list. Using its
+    // identity avoids rebuilding a long key on every PlayButton update.
+    return 'list:${identityHashCode(chapters)}:${chapters.length}';
+  }
+
+  _PracticeScopeCache _practiceScope(List<ChapterData> chapters) {
+    final key = _practiceScopeKey(chapters);
+    final cached = _practiceScopeCache.remove(key);
+    if (cached != null) {
+      // Map insertion order is used as a small LRU: most recently used goes last.
+      _practiceScopeCache[key] = cached;
+      return cached;
+    }
+
+    final words = <String>{};
     var unknown = 0;
     var again = 0;
     for (final chapter in chapters) {
       for (final entry in chapter.words) {
-        final key = normalizeWord(entry.word);
-        if (!seen.add(key)) continue;
-        if (_known.contains(key)) continue;
-        if (_showAgain.contains(key)) {
+        final word = normalizeWord(entry.word);
+        if (word.isEmpty || !words.add(word)) continue;
+        if (_known.contains(word)) continue;
+        if (_showAgain.contains(word)) {
           again++;
         } else {
           unknown++;
         }
       }
     }
-    return PracticeCounts(unknown, again);
+    final scope = _PracticeScopeCache(words: words, unknown: unknown, showAgain: again);
+    _practiceScopeCache[key] = scope;
+    while (_practiceScopeCache.length > _maxPracticeScopeCaches) {
+      _removePracticeScopeCache(_practiceScopeCache.keys.first);
+    }
+    return scope;
   }
+
+  void _removePracticeScopeCache(String key) {
+    _practiceScopeCache.remove(key);
+  }
+
+  void _refreshCachedWordCounts() {
+    for (final entry in _knownCountCache.entries.toList()) {
+      final words = _uniqueCache[entry.key];
+      if (words != null) {
+        _knownCountCache[entry.key] = words.where(_known.contains).length;
+        _showAgainCountCache[entry.key] = words.where(_showAgain.contains).length;
+      }
+    }
+    for (final signal in _wordStateSignals.entries) {
+      final refreshed = getWordState(signal.key);
+      if (signal.value.value != refreshed) signal.value.value = refreshed;
+    }
+    for (final scope in _practiceScopeCache.values) {
+      var unknown = 0;
+      var again = 0;
+      for (final word in scope.words) {
+        if (_known.contains(word)) continue;
+        if (_showAgain.contains(word)) {
+          again++;
+        } else {
+          unknown++;
+        }
+      }
+      scope.unknown = unknown;
+      scope.showAgain = again;
+    }
+  }
+
+  void _invalidateBookWordCache(String bookId, {bool bumpGeneration = true}) {
+    if (bumpGeneration) {
+      _bookWordCacheGenerations[bookId] =
+          (_bookWordCacheGenerations[bookId] ?? 0) + 1;
+      _bookWordCacheFutures.remove(bookId);
+    }
+    _uniqueCache.remove(bookId);
+    _knownCountCache.remove(bookId);
+    _showAgainCountCache.remove(bookId);
+  }
+
+  void _clearPracticeScopeCaches() {
+    _practiceScopeCache.clear();
+  }
+
+  bool _applyWordState(String key, WordState newState) {
+    final oldState = getWordState(key);
+    if (oldState == newState) return false;
+
+    _known.remove(key);
+    _showAgain.remove(key);
+    if (newState == WordState.known) {
+      _known.add(key);
+    } else if (newState == WordState.showAgain) {
+      _showAgain.add(key);
+    }
+    final signal = _wordStateSignals[key];
+    if (signal != null && signal.value != newState) {
+      signal.value = newState;
+    }
+
+    // The number of books is normally small. Checking their cached unique-word
+    // sets avoids a second map/list allocation for every distinct word.
+    for (final entry in _uniqueCache.entries) {
+      if (!entry.value.contains(key)) continue;
+      final bookId = entry.key;
+      if ((oldState == WordState.known) != (newState == WordState.known)) {
+        final current = _knownCountCache[bookId];
+        if (current != null) {
+          _knownCountCache[bookId] = current +
+              (newState == WordState.known ? 1 : -1);
+        }
+      }
+      if ((oldState == WordState.showAgain) !=
+          (newState == WordState.showAgain)) {
+        final current = _showAgainCountCache[bookId];
+        if (current != null) {
+          _showAgainCountCache[bookId] = current +
+              (newState == WordState.showAgain ? 1 : -1);
+        }
+      }
+    }
+
+    // Update only cached practice scopes that contain this word.
+    // The scope cache is deliberately bounded (16 entries), so checking each
+    // cached word set avoids a large word→scope reverse index in memory.
+    for (final scope in _practiceScopeCache.values) {
+      if (!scope.words.contains(key)) continue;
+      if (oldState == WordState.unknown) scope.unknown--;
+      if (oldState == WordState.showAgain) scope.showAgain--;
+      if (newState == WordState.unknown) scope.unknown++;
+      if (newState == WordState.showAgain) scope.showAgain++;
+    }
+    return true;
+  }
+
+  /// Distinct words in the given chapters that are unknown / show again.
+  /// Known words are never counted. Words are global, so a word that is
+  /// known anywhere is known everywhere.
+  PracticeCounts practiceCounts(List<ChapterData> chapters) {
+    final scope = _practiceScope(chapters);
+    return PracticeCounts(scope.unknown, scope.showAgain);
+  }
+
+  int uniqueWordCount(List<ChapterData> chapters) =>
+      _practiceScope(chapters).words.length;
 
   /// Distinct words of the given chapters to play, filtered by what the
   /// user ticked. Known words are always excluded.
@@ -303,25 +635,28 @@ class BookStore extends ChangeNotifier {
   Future<void> setWordState(String word, WordState newState) async {
     final key = normalizeWord(word);
     if (key.isEmpty) return;
-    _known.remove(key);
-    _showAgain.remove(key);
-    if (newState == WordState.known) {
-      _known.add(key);
-    } else if (newState == WordState.showAgain) {
-      _showAgain.add(key);
-    }
-    notifyListeners();
+    if (!_applyWordState(key, newState)) return;
+    wordStateRevision.value++;
     await _saveKnownWords();
   }
 
   Future<void> markAllChapterKnown(ChapterData chapter) async {
+    var changed = false;
+    var processed = 0;
     for (final entry in chapter.words) {
       final key = normalizeWord(entry.word);
-      if (_showAgain.contains(key)) continue; // Show Again is protected
-      _known.add(key);
+      if (key.isEmpty || _showAgain.contains(key)) continue;
+      changed = _applyWordState(key, WordState.known) || changed;
+      processed++;
+      // Yield periodically so a very large page never monopolizes a frame.
+      if (processed % 1500 == 0) {
+        await Future<void>.delayed(Duration.zero);
+      }
     }
-    notifyListeners();
-    await _saveKnownWords();
+    if (changed) {
+      wordStateRevision.value++;
+      await _saveKnownWords();
+    }
   }
 
   Future<String?> importBook() async {
@@ -424,7 +759,8 @@ class BookStore extends ChangeNotifier {
         imagePath: imagePath,
       ));
       await _saveImageMetadata(book);
-      _uniqueCache.remove(book.id);
+      _invalidateBookWordCache(book.id);
+      _clearPracticeScopeCaches();
       notifyListeners();
     } catch (_) {
       await File(imagePath).delete().catchError((_) => File(imagePath));
@@ -461,7 +797,7 @@ class BookStore extends ChangeNotifier {
     // selection sets and widgets therefore keep referring to the same page.
     book.pages[index].title = clean;
     await _saveImageMetadata(book);
-    _uniqueCache.remove(book.id);
+    // Renaming changes the alphabetical page index, not the vocabulary cache.
     notifyListeners();
   }
 
@@ -487,7 +823,8 @@ class BookStore extends ChangeNotifier {
     }
 
     await _saveImageMetadata(book);
-    _uniqueCache.remove(book.id);
+    _invalidateBookWordCache(book.id);
+    _clearPracticeScopeCaches();
     notifyListeners();
   }
 
@@ -504,7 +841,8 @@ class BookStore extends ChangeNotifier {
 
     books.removeWhere((book) => targetIds.contains(book.id));
     for (final book in removed) {
-      _uniqueCache.remove(book.id);
+      _invalidateBookWordCache(book.id);
+      _clearPracticeScopeCaches();
       if (book.isImageBook) {
         final folder = File(book.jsonPath).parent;
         if (await folder.exists()) await folder.delete(recursive: true);
@@ -531,6 +869,50 @@ class BookStore extends ChangeNotifier {
         .toList();
     await _prefs.setStringList('book_records', records);
   }
+  @override
+  void dispose() {
+    wordStateRevision.dispose();
+    for (final signal in _wordStateSignals.values.toList()) {
+      signal.dispose();
+    }
+    _wordStateSignals.clear();
+    super.dispose();
+  }
+}
+
+class _WordStateSignal extends ValueNotifier<WordState> {
+  _WordStateSignal(super.value, {required this.onNoListeners});
+
+  final VoidCallback onNoListeners;
+  int _listenerCount = 0;
+  int get listenerCount => _listenerCount;
+
+  @override
+  void addListener(VoidCallback listener) {
+    super.addListener(listener);
+    _listenerCount++;
+  }
+
+  @override
+  void removeListener(VoidCallback listener) {
+    super.removeListener(listener);
+    if (_listenerCount > 0) {
+      _listenerCount--;
+      if (_listenerCount == 0) onNoListeners();
+    }
+  }
+}
+
+class _PracticeScopeCache {
+  _PracticeScopeCache({
+    required this.words,
+    required this.unknown,
+    required this.showAgain,
+  });
+
+  final Set<String> words;
+  int unknown;
+  int showAgain;
 }
 
 // ───────────────────────── JSON parser ─────────────────────────

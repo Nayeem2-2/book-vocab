@@ -232,6 +232,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "4.12.0"
+  indexed_sliver_list:
+    dependency: "direct main"
+    description:
+      name: indexed_sliver_list
+      sha256: "9f4778492cfbc8db0d1908962a0b645375e355117a7f6a5f5790356addacc1b7"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.0.1"
   jni:
     dependency: transitive
     description:

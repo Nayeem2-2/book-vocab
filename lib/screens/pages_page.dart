@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:indexed_sliver_list/indexed_sliver_list.dart';
 
 import '../models/book_models.dart';
 import '../services/book_store.dart';
@@ -19,15 +22,49 @@ class PagesPage extends StatefulWidget {
 
 class _PagesPageState extends State<PagesPage> {
   final TextEditingController _searchController = TextEditingController();
-  final ScrollController _scrollController = ScrollController();
+  IndexedScrollController _scrollController = IndexedScrollController();
   final Set<String> _selectedPageIds = <String>{};
   String _query = '';
   bool busy = false;
+  _PagesListData? _cachedListData;
+  Timer? _searchDebounce;
 
   bool get _selectionMode => _selectedPageIds.isNotEmpty;
 
   @override
+  void initState() {
+    super.initState();
+    widget.store.addListener(_onStoreStructureChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant PagesPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.store != widget.store) {
+      oldWidget.store.removeListener(_onStoreStructureChanged);
+      widget.store.addListener(_onStoreStructureChanged);
+      _cachedListData = null;
+      _replaceListController();
+    }
+  }
+
+  void _onStoreStructureChanged() {
+    _cachedListData = null;
+    _replaceListController();
+  }
+
+  void _replaceListController() {
+    final oldController = _scrollController;
+    _scrollController = IndexedScrollController();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      oldController.dispose();
+    });
+  }
+
+  @override
   void dispose() {
+    widget.store.removeListener(_onStoreStructureChanged);
+    _searchDebounce?.cancel();
     _searchController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -40,13 +77,17 @@ class _PagesPageState extends State<PagesPage> {
       ..showSnackBar(SnackBar(content: Text(value)));
   }
 
-  Future<void> _downloadDictionary() async {
+  Future<void> _reloadBundledDictionary() async {
     setState(() => busy = true);
     try {
       await widget.store.dictionary.load();
-      _message('English–Bangla dictionary downloaded and cached for offline use.');
+      _message('Bundled English–Bangla dictionary loaded.');
     } catch (error) {
-      _message('Dictionary download failed. Check internet and retry: $error');
+      _message(
+        'Could not load the bundled dictionary. Verify '
+        'assets/dictionary/E2Bdatabase.json and its pubspec.yaml asset entry. '
+        'Details: $error',
+      );
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -167,15 +208,30 @@ class _PagesPageState extends State<PagesPage> {
     );
   }
 
+  void _scheduleSearch(String value) {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 140), () {
+      if (!mounted || value == _query) return;
+      _cachedListData = null;
+      _replaceListController();
+      setState(() => _query = value);
+    });
+  }
+
+  void _clearSearch() {
+    _searchDebounce?.cancel();
+    _searchController.clear();
+    _cachedListData = null;
+    _replaceListController();
+    setState(() => _query = '');
+  }
+
   Widget _searchField() {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
       child: TextField(
         controller: _searchController,
-        onChanged: (value) {
-          if (_scrollController.hasClients) _scrollController.jumpTo(0);
-          setState(() => _query = value);
-        },
+        onChanged: _scheduleSearch,
         textInputAction: TextInputAction.search,
         decoration: InputDecoration(
           hintText: 'Search pages...',
@@ -184,11 +240,7 @@ class _PagesPageState extends State<PagesPage> {
               ? null
               : IconButton(
                   tooltip: 'Clear search',
-                  onPressed: () {
-                    _searchController.clear();
-                    if (_scrollController.hasClients) _scrollController.jumpTo(0);
-                    setState(() => _query = '');
-                  },
+                  onPressed: _clearSearch,
                   icon: const Icon(Icons.close),
                 ),
           filled: true,
@@ -214,7 +266,7 @@ class _PagesPageState extends State<PagesPage> {
     for (final page in pages) {
       final trimmed = page.title.trim();
       final initial = trimmed.isEmpty ? '#' : trimmed[0].toUpperCase();
-      final letter = RegExp(r'^[A-Z]$').hasMatch(initial) ? initial : '#';
+      final letter = isEnglishAlphabetLetter(initial) ? initial : '#';
       groups.putIfAbsent(letter, () => <ChapterData>[]).add(page);
     }
     return groups;
@@ -243,6 +295,46 @@ class _PagesPageState extends State<PagesPage> {
         ),
       ),
     );
+  }
+
+  _PagesListData _listData() {
+    final cached = _cachedListData;
+    if (cached != null && cached.query == _query) return cached;
+
+    // This order is used for Previous/Next after entering from the Pages list.
+    final alphabeticalPages = List<ChapterData>.from(widget.book.pages)
+      ..sort((a, b) => a.title.trim().toLowerCase().compareTo(
+            b.title.trim().toLowerCase(),
+          ));
+    final visiblePages = _query.trim().isEmpty
+        ? alphabeticalPages
+        : rankAndSortByName<ChapterData>(
+            widget.book.pages,
+            (page) => page.title,
+            _query,
+          );
+    final groupedPages = _groupPagesByInitial(visiblePages);
+    final rows = <Object>[];
+    final sectionIndexes = <String, int>{};
+    for (final group in groupedPages.entries) {
+      sectionIndexes[group.key] = rows.length;
+      rows.add(group.key);
+      rows.addAll(group.value);
+    }
+    final indexLetters = groupedPages.keys
+        .where((letter) => isEnglishAlphabetLetter(letter))
+        .toList(growable: false);
+
+    final data = _PagesListData(
+      query: _query,
+      alphabeticalPages: alphabeticalPages,
+      visiblePages: visiblePages,
+      rows: rows,
+      sectionIndexes: sectionIndexes,
+      indexLetters: indexLetters,
+    );
+    _cachedListData = data;
+    return data;
   }
 
   Widget _pageTile(ChapterData page, List<ChapterData> orderedPages) {
@@ -329,33 +421,14 @@ class _PagesPageState extends State<PagesPage> {
     return AnimatedBuilder(
       animation: widget.store,
       builder: (context, _) {
-        // The Pages directory and navigation entered from it are alphabetical.
-        // The BookData.pages list itself remains untouched in scan/import order.
-        final alphabeticalPages = List<ChapterData>.from(widget.book.pages)
-          ..sort((a, b) => a.title.trim().toLowerCase().compareTo(
-                b.title.trim().toLowerCase(),
-              ));
-        final visiblePages = rankAndSortByName<ChapterData>(
-          widget.book.pages,
-          (page) => page.title,
-          _query,
-        );
-        final groupedPages = _groupPagesByInitial(visiblePages);
-        final rows = <Object>[];
-        final sectionOffsets = <String, double>{};
-        var contentOffset = 0.0;
-        for (final group in groupedPages.entries) {
-          sectionOffsets[group.key] = contentOffset;
-          rows.add(group.key);
-          contentOffset += 32;
-          for (final page in group.value) {
-            rows.add(page);
-            contentOffset += 88;
-          }
-        }
-        final indexLetters = groupedPages.keys
-            .where((letter) => RegExp(r'^[A-Z]$').hasMatch(letter))
-            .toList();
+        // Cached separately from selection state so long-press/tap selection
+        // never repeats the full-page sort and grouping operation.
+        final listData = _listData();
+        final alphabeticalPages = listData.alphabeticalPages;
+        final visiblePages = listData.visiblePages;
+        final rows = listData.rows;
+        final sectionIndexes = listData.sectionIndexes;
+        final indexLetters = listData.indexLetters;
 
         return Scaffold(
           appBar: AppBar(
@@ -397,27 +470,45 @@ class _PagesPageState extends State<PagesPage> {
           body: Column(
             children: [
               _searchField(),
-              if (!widget.store.dictionary.isLoaded)
-                MaterialBanner(
-                  content: const Text(
-                    'The English–Bangla dictionary is not cached yet. Internet is needed for its first download.',
-                  ),
-                  leading: const Icon(Icons.cloud_download_outlined),
-                  actions: [
-                    TextButton(
-                      onPressed: busy ? null : _downloadDictionary,
-                      child: const Text('Download'),
+              ValueListenableBuilder<bool>(
+                valueListenable: widget.store.dictionary.loadedListenable,
+                builder: (context, dictionaryLoaded, _) {
+                  if (dictionaryLoaded) return const SizedBox.shrink();
+                  return MaterialBanner(
+                    content: const Text(
+                      'The bundled English–Bangla dictionary could not be loaded. Check that E2Bdatabase.json is in assets/dictionary and registered in pubspec.yaml.',
                     ),
-                  ],
-                ),
+                    leading: const Icon(Icons.menu_book_outlined),
+                    actions: [
+                      TextButton(
+                        onPressed: busy ? null : _reloadBundledDictionary,
+                        child: const Text('Retry'),
+                      ),
+                    ],
+                  );
+                },
+              ),
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                 child: Row(
                   children: [
                     Expanded(
-                      child: Text(
-                        '${widget.book.pages.length} pages  •  ${widget.store.totalUniqueWords(widget.book)} unique words',
-                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      child: ValueListenableBuilder<int>(
+                        valueListenable: widget.store.wordStateRevision,
+                        builder: (context, _, __) => FutureBuilder<void>(
+                          future: widget.store.ensureBookWordCache(widget.book),
+                          builder: (context, snapshot) {
+                            final summary = widget.store.hasBookWordCache(widget.book)
+                                ? '${widget.book.pages.length} pages  •  ${widget.store.totalUniqueWords(widget.book)} unique words'
+                                : '${widget.book.pages.length} pages  •  Preparing word statistics…';
+                            return Text(
+                              summary,
+                              style: const TextStyle(fontWeight: FontWeight.w600),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            );
+                          },
+                        ),
                       ),
                     ),
                     if (!_selectionMode)
@@ -425,6 +516,7 @@ class _PagesPageState extends State<PagesPage> {
                         store: widget.store,
                         title: widget.book.name,
                         chapters: widget.book.pages,
+                        book: widget.book,
                       ),
                   ],
                 ),
@@ -448,10 +540,12 @@ class _PagesPageState extends State<PagesPage> {
                         : Stack(
                             children: [
                               Positioned.fill(
-                                child: ListView.builder(
+                                child: IndexedListView(
                                   controller: _scrollController,
                                   padding: const EdgeInsets.fromLTRB(12, 0, 27, 100),
                                   itemCount: rows.length,
+                                  estimatedItemExtent: 88,
+                                  addAutomaticKeepAlives: false,
                                   itemBuilder: (context, index) {
                                     final row = rows[index];
                                     return row is String
@@ -473,20 +567,15 @@ class _PagesPageState extends State<PagesPage> {
                                     names: indexLetters,
                                     itemExtent: 0,
                                     onLetterSelected: (letter) {
-                                      final target = sectionOffsets[letter];
+                                      final target = sectionIndexes[letter];
                                       if (target == null ||
                                           !_scrollController.hasClients) {
                                         return;
                                       }
-                                      _scrollController.animateTo(
-                                        target.clamp(
-                                          0.0,
-                                          _scrollController.position.maxScrollExtent,
-                                        ).toDouble(),
-                                        duration:
-                                            const Duration(milliseconds: 110),
-                                        curve: Curves.easeOutCubic,
-                                      );
+                                      unawaited(_scrollController.jumpToIndex(
+                                        target,
+                                        alignment: 0,
+                                      ));
                                     },
                                   ),
                                 ),
@@ -499,4 +588,23 @@ class _PagesPageState extends State<PagesPage> {
       },
     );
   }
+}
+
+
+class _PagesListData {
+  const _PagesListData({
+    required this.query,
+    required this.alphabeticalPages,
+    required this.visiblePages,
+    required this.rows,
+    required this.sectionIndexes,
+    required this.indexLetters,
+  });
+
+  final String query;
+  final List<ChapterData> alphabeticalPages;
+  final List<ChapterData> visiblePages;
+  final List<Object> rows;
+  final Map<String, int> sectionIndexes;
+  final List<String> indexLetters;
 }

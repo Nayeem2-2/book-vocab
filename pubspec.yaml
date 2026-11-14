@@ -17,6 +17,7 @@ dependencies:
   image: 4.12.0
   http: 1.6.0
   unorm_dart: 0.3.2
+  indexed_sliver_list: ^0.0.1
 
 dev_dependencies:
   flutter_test:
@@ -26,6 +27,9 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
+  assets:
+    - assets/dictionary/E2Bdatabase.json
 
 flutter_launcher_icons:
   android: true

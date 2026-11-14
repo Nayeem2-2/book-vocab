@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:indexed_sliver_list/indexed_sliver_list.dart';
 
 import '../models/book_models.dart';
 import '../services/book_store.dart';
@@ -33,15 +36,17 @@ class ChapterPage extends StatefulWidget {
 class _ChapterPageState extends State<ChapterPage> {
   bool showKnown = false;
   String query = '';
-  double _sliderValue = 0.0;
   bool _addingPage = false;
 
   late List<ChapterData> _navigationPages;
   late int _currentIndex;
 
-  final ScrollController _wordScrollController = ScrollController();
+  IndexedScrollController _wordScrollController = IndexedScrollController();
   final TextEditingController _queryController = TextEditingController();
-  final Map<String, GlobalKey> _sectionKeys = <String, GlobalKey>{};
+  Timer? _searchDebounce;
+  final Map<String, Map<String, List<WordEntry>>> _groupedWordCache = {};
+  _VocabularyListModel? _visibleListCache;
+  String? _visibleListCacheKey;
 
   bool get _isImageBook => widget.book.isImageBook;
 
@@ -67,9 +72,18 @@ class _ChapterPageState extends State<ChapterPage> {
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _wordScrollController.dispose();
     _queryController.dispose();
     super.dispose();
+  }
+
+  void _resetWordScrollController() {
+    final oldController = _wordScrollController;
+    _wordScrollController = IndexedScrollController();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      oldController.dispose();
+    });
   }
 
   void _scrollWordsToTop() {
@@ -88,11 +102,12 @@ class _ChapterPageState extends State<ChapterPage> {
       return;
     }
 
+    _searchDebounce?.cancel();
+    _resetWordScrollController();
     setState(() {
       _currentIndex = targetIndex;
       query = '';
       _queryController.clear();
-      _sectionKeys.clear();
     });
     _scrollWordsToTop();
   }
@@ -116,6 +131,8 @@ class _ChapterPageState extends State<ChapterPage> {
       (page) => page.stableId == result,
     );
     if (returnedIndex >= 0 && returnedIndex != _currentIndex) {
+      _searchDebounce?.cancel();
+      _resetWordScrollController();
       setState(() => _currentIndex = returnedIndex);
       _scrollWordsToTop();
     }
@@ -132,20 +149,19 @@ class _ChapterPageState extends State<ChapterPage> {
       );
       if (!mounted || added.isEmpty) return;
 
-      // This entry point is the explicit Add Page action. Switch to the
-      // permanent scan/import sequence and open the newest added page.
       final scanOrder = List<ChapterData>.from(widget.book.pages);
       final newestId = added.last.stableId;
       final newestIndex = scanOrder.indexWhere(
         (page) => page.stableId == newestId,
       );
       if (newestIndex >= 0) {
+        _searchDebounce?.cancel();
+        _resetWordScrollController();
         setState(() {
           _navigationPages = scanOrder;
           _currentIndex = newestIndex;
           query = '';
           _queryController.clear();
-          _sectionKeys.clear();
         });
         _scrollWordsToTop();
       }
@@ -164,29 +180,50 @@ class _ChapterPageState extends State<ChapterPage> {
     }
   }
 
-  void _scrollToLetter(String letter) {
-    final sectionContext = _sectionKeys[letter]?.currentContext;
-    if (sectionContext == null) return;
-    Scrollable.ensureVisible(
-      sectionContext,
-      duration: const Duration(milliseconds: 110),
-      curve: Curves.easeOutCubic,
-      alignment: 0,
-    );
+  void _scheduleWordSearch(String value) {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 140), () {
+      if (!mounted) return;
+      final nextQuery = value.trim();
+      if (nextQuery == query) return;
+      _resetWordScrollController();
+      setState(() => query = nextQuery);
+    });
   }
 
-  Map<String, List<WordEntry>> _groupWords(List<WordEntry> entries) {
-    final sorted = List<WordEntry>.from(entries)
-      ..sort((a, b) => a.word.trim().toLowerCase().compareTo(
-            b.word.trim().toLowerCase(),
-          ));
+  void _clearWordSearch() {
+    _searchDebounce?.cancel();
+    _queryController.clear();
+    _resetWordScrollController();
+    setState(() => query = '');
+  }
+
+  Map<String, List<WordEntry>> _groupedWordsFor(ChapterData chapter) {
+    final cacheKey = chapter.stableId;
+    final cached = _groupedWordCache.remove(cacheKey);
+    if (cached != null &&
+        cached.values.fold<int>(0, (sum, group) => sum + group.length) ==
+            chapter.words.length) {
+      _groupedWordCache[cacheKey] = cached;
+      return cached;
+    }
+
+    // Normalize each word once before sorting instead of allocating a new
+    // lowercase/trimmed string for every comparator invocation.
+    final sortable = chapter.words
+        .map((entry) => _SortableWordEntry(
+              entry,
+              entry.word.trim().toLowerCase(),
+            ))
+        .toList()
+      ..sort((a, b) => a.sortKey.compareTo(b.sortKey));
 
     final groups = <String, List<WordEntry>>{};
-    for (final entry in sorted) {
-      final trimmed = entry.word.trim();
-      final first = trimmed.isEmpty ? '#' : trimmed[0].toUpperCase();
-      final key = RegExp(r'^[A-Z]$').hasMatch(first) ? first : '#';
-      groups.putIfAbsent(key, () => <WordEntry>[]).add(entry);
+    for (final item in sortable) {
+      final word = item.entry.word.trim();
+      final initial = word.isEmpty ? '#' : word[0].toUpperCase();
+      final letter = isEnglishAlphabetLetter(initial) ? initial : '#';
+      groups.putIfAbsent(letter, () => <WordEntry>[]).add(item.entry);
     }
 
     final keys = groups.keys.toList()
@@ -195,13 +232,129 @@ class _ChapterPageState extends State<ChapterPage> {
         if (b == '#') return -1;
         return a.compareTo(b);
       });
-    return <String, List<WordEntry>>{
+    final ordered = <String, List<WordEntry>>{
       for (final key in keys) key: groups[key]!,
     };
+    _groupedWordCache[cacheKey] = ordered;
+
+    // Only the current and a few recently visited pages need a sorted copy.
+    // The original page data remains in scan/import order in BookStore.
+    while (_groupedWordCache.length > 3) {
+      _groupedWordCache.remove(_groupedWordCache.keys.first);
+    }
+    return ordered;
+  }
+
+  bool _matchesWord(WordEntry entry, String normalizedQuery) {
+    if (normalizedQuery.isEmpty) return true;
+    if (entry.word.toLowerCase().contains(normalizedQuery)) return true;
+    return entry.meanings.any(
+      (meaning) => meaning.toLowerCase().contains(normalizedQuery),
+    );
+  }
+
+  _VocabularyListModel _visibleListFor(ChapterData chapter) {
+    final normalizedQuery = query.trim().toLowerCase();
+    final cacheKey = '${chapter.stableId}|${chapter.words.length}|$normalizedQuery|$_isImageBook';
+    final cached = _visibleListCache;
+    if (cached != null && _visibleListCacheKey == cacheKey) return cached;
+
+    final sections = <_VocabularySection>[];
+    final letterIndexes = <String, int>{};
+    var itemCount = 0;
+
+    if (_isImageBook) {
+      final groups = _groupedWordsFor(chapter);
+      for (final group in groups.entries) {
+        final visibleWords = normalizedQuery.isEmpty
+            ? group.value
+            : group.value
+                .where((entry) => _matchesWord(entry, normalizedQuery))
+                .toList(growable: false);
+        if (visibleWords.isEmpty) continue;
+
+        final headerLetter = group.key == '#' ? null : group.key;
+        if (headerLetter != null) letterIndexes[headerLetter] = itemCount;
+        sections.add(_VocabularySection(
+          letter: headerLetter,
+          words: visibleWords,
+          startIndex: itemCount,
+        ));
+        itemCount += visibleWords.length + (headerLetter == null ? 0 : 1);
+      }
+    } else {
+      // JSON books deliberately preserve their original source order.
+      final visibleWords = normalizedQuery.isEmpty
+          ? chapter.words
+          : chapter.words
+              .where((entry) => _matchesWord(entry, normalizedQuery))
+              .toList(growable: false);
+      if (visibleWords.isNotEmpty) {
+        sections.add(_VocabularySection(
+          letter: null,
+          words: visibleWords,
+          startIndex: 0,
+        ));
+        itemCount = visibleWords.length;
+      }
+    }
+
+    final model = _VocabularyListModel(
+      sections: sections,
+      letterIndexes: letterIndexes,
+      itemCount: itemCount,
+    );
+    _visibleListCacheKey = cacheKey;
+    _visibleListCache = model;
+    return model;
+  }
+
+  Widget _letterHeader(String letter) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(2, 12, 8, 8),
+      child: Row(
+        children: [
+          Container(
+            width: 32,
+            height: 32,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: const Color(0xFFE4EFE8),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Text(
+              letter,
+              style: const TextStyle(
+                color: Color(0xFF356859),
+                fontSize: 16,
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Divider(
+              color: const Color(0xFF356859).withOpacity(0.16),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _wordCard(WordEntry entry) {
-    final state = widget.store.getWordState(entry.word);
+    return ValueListenableBuilder<WordState>(
+      valueListenable: widget.store.wordStateListenable(entry.word),
+      builder: (context, state, _) {
+        if (state == WordState.known && !showKnown) {
+          return const SizedBox.shrink();
+        }
+        return _buildWordCard(entry, state);
+      },
+    );
+  }
+
+  Widget _buildWordCard(WordEntry entry, WordState state) {
     final badgeColor = state == WordState.known
         ? const Color(0xFF27845B)
         : state == WordState.showAgain
@@ -447,108 +600,79 @@ class _ChapterPageState extends State<ChapterPage> {
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: widget.store,
-      builder: (context, _) {
-        final currentChapter = _currentChapter;
-        final visible = currentChapter.words.where((entry) {
-          final state = widget.store.getWordState(entry.word);
-          final known = state == WordState.known;
-          final matchesStatus = showKnown || !known;
-          final normalizedQuery = query.toLowerCase();
-          final matchesQuery = query.isEmpty ||
-              entry.word.toLowerCase().contains(normalizedQuery) ||
-              entry.meanings.any(
-                (meaning) => meaning.toLowerCase().contains(normalizedQuery),
-              );
-          return matchesStatus && matchesQuery;
-        }).toList();
+    final currentChapter = _currentChapter;
 
-        final knownInChapter = currentChapter.words
-            .where((word) =>
-                widget.store.getWordState(word.word) == WordState.known)
-            .length;
-        final unknownInChapter = currentChapter.words.length - knownInChapter;
-
-        // OCR vocabulary is grouped alphabetically. JSON chapter vocabulary
-        // retains its existing source order to avoid changing imported books.
-        final groupedWords = _isImageBook ? _groupWords(visible) : null;
-        final availableLetters = groupedWords == null
-            ? const <String>[]
-            : groupedWords.keys.where((key) => key != '#').toList();
-
-        for (final letter in availableLetters) {
-          _sectionKeys.putIfAbsent(letter, () => GlobalKey());
-        }
-
-        return Scaffold(
-          appBar: AppBar(
-            title: Text(
-              currentChapter.title,
-              style: const TextStyle(fontWeight: FontWeight.w800),
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          currentChapter.title,
+          style: const TextStyle(fontWeight: FontWeight.w800),
+        ),
+        actions: [
+          if (currentChapter.imagePath != null)
+            IconButton(
+              tooltip: 'View scanned page image',
+              onPressed: _openImageViewer,
+              icon: const Icon(Icons.image_outlined),
             ),
-            actions: [
-              if (currentChapter.imagePath != null)
-                IconButton(
-                  tooltip: 'View scanned page image',
-                  onPressed: _openImageViewer,
-                  icon: const Icon(Icons.image_outlined),
-                ),
-              PlayButton(
-                store: widget.store,
-                title: currentChapter.title,
-                chapters: [currentChapter],
-              ),
-              const SizedBox(width: 4),
-            ],
+          PlayButton(
+            store: widget.store,
+            title: currentChapter.title,
+            chapters: [currentChapter],
           ),
-          body: Stack(
+          const SizedBox(width: 4),
+        ],
+      ),
+      body: Stack(
+        children: [
+          Column(
             children: [
-              Column(
-                children: [
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                    child: Column(
-                      children: [
-                        TextField(
-                          controller: _queryController,
-                          onChanged: (value) =>
-                              setState(() => query = value.trim()),
-                          decoration: InputDecoration(
-                            hintText: 'Search words or meanings',
-                            prefixIcon: const Icon(Icons.search),
-                            suffixIcon: query.isEmpty
-                                ? null
-                                : IconButton(
-                                    tooltip: 'Clear search',
-                                    onPressed: () {
-                                      _queryController.clear();
-                                      setState(() => query = '');
-                                    },
-                                    icon: const Icon(Icons.close),
-                                  ),
-                            filled: true,
-                            fillColor: Colors.white,
-                            contentPadding:
-                                const EdgeInsets.symmetric(vertical: 12),
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(14),
-                              borderSide:
-                                  const BorderSide(color: Color(0xFFE8ECE7)),
-                            ),
-                            enabledBorder: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(14),
-                              borderSide:
-                                  const BorderSide(color: Color(0xFFE8ECE7)),
-                            ),
-                          ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                child: Column(
+                  children: [
+                    TextField(
+                      controller: _queryController,
+                      onChanged: _scheduleWordSearch,
+                      textInputAction: TextInputAction.search,
+                      decoration: InputDecoration(
+                        hintText: 'Search words or meanings',
+                        prefixIcon: const Icon(Icons.search),
+                        suffixIcon: query.isEmpty
+                            ? null
+                            : IconButton(
+                                tooltip: 'Clear search',
+                                onPressed: _clearWordSearch,
+                                icon: const Icon(Icons.close),
+                              ),
+                        filled: true,
+                        fillColor: Colors.white,
+                        contentPadding:
+                            const EdgeInsets.symmetric(vertical: 12),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide:
+                              const BorderSide(color: Color(0xFFE8ECE7)),
                         ),
-                        const SizedBox(height: 10),
-                        Row(
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          borderSide:
+                              const BorderSide(color: Color(0xFFE8ECE7)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    ValueListenableBuilder<int>(
+                      valueListenable: widget.store.wordStateRevision,
+                      builder: (context, _, __) {
+                        final counts = widget.store.practiceCounts([currentChapter]);
+                        final total = widget.store.uniqueWordCount([currentChapter]);
+                        final known = (total - counts.total).clamp(0, total);
+                        return Row(
                           children: [
                             Expanded(
                               child: Text(
-                                '$unknownInChapter unknown/review  •  $knownInChapter known',
+                                '${counts.total} unknown/review  •  $known known',
                                 style: const TextStyle(
                                   color: Colors.black54,
                                   fontSize: 13,
@@ -568,193 +692,299 @@ class _ChapterPageState extends State<ChapterPage> {
                                   setState(() => showKnown = value),
                             ),
                           ],
+                        );
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: Builder(
+                  builder: (context) {
+                    final rows = _visibleListFor(currentChapter);
+                    final letters = rows.letterIndexes.keys.toList(growable: false);
+
+                    return Stack(
+                      children: [
+                        Positioned.fill(
+                          child: IndexedListView(
+                            controller: _wordScrollController,
+                            padding: const EdgeInsets.fromLTRB(16, 4, 42, 112),
+                            estimatedItemExtent: 112,
+                            itemCount: rows.itemCount,
+                            addAutomaticKeepAlives: false,
+                            itemBuilder: (context, index) {
+                              final row = rows.rowAt(index, currentChapter.stableId);
+                              final child = row.letter != null
+                                  ? _letterHeader(row.letter!)
+                                  : Padding(
+                                      padding:
+                                          const EdgeInsets.only(bottom: 8),
+                                      child: _wordCard(row.entry!),
+                                    );
+                              return KeyedSubtree(key: row.key, child: child);
+                            },
+                          ),
+                        ),
+                        if (_isImageBook && letters.isNotEmpty)
+                          Positioned(
+                            right: 1,
+                            top: 4,
+                            bottom: 8,
+                            child: AlphabetFastScroller(
+                              controller: _wordScrollController,
+                              names: letters,
+                              itemExtent: 0,
+                              onLetterSelected: (letter) {
+                                final target = rows.letterIndexes[letter];
+                                if (target != null &&
+                                    _wordScrollController.hasClients) {
+                                  unawaited(_wordScrollController.jumpToIndex(
+                                    target,
+                                    alignment: 0,
+                                  ));
+                                }
+                              },
+                            ),
+                          ),
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: ValueListenableBuilder<int>(
+                              valueListenable: widget.store.wordStateRevision,
+                              builder: (context, _, __) {
+                                final counts =
+                                    widget.store.practiceCounts([currentChapter]);
+                                final empty = rows.itemCount == 0 ||
+                                    (query.isEmpty && !showKnown && counts.total == 0);
+                                if (!empty) return const SizedBox.shrink();
+                                final message = rows.itemCount == 0
+                                    ? (query.isNotEmpty
+                                        ? 'No matching words.'
+                                        : showKnown
+                                            ? 'This chapter has no words.'
+                                            : 'All words in this chapter are marked known.')
+                                    : 'All words in this chapter are marked known.';
+                                return ColoredBox(
+                                  color: Theme.of(context).scaffoldBackgroundColor,
+                                  child: Center(
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(28),
+                                      child: Text(
+                                        message,
+                                        textAlign: TextAlign.center,
+                                        style: const TextStyle(
+                                          color: Colors.black54,
+                                          fontSize: 16,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
                         ),
                       ],
-                    ),
-                  ),
-                  Expanded(
-                    child: visible.isEmpty
-                        ? Center(
-                            child: Padding(
-                              padding: const EdgeInsets.all(28),
-                              child: Text(
-                                query.isNotEmpty
-                                    ? 'No matching words.'
-                                    : showKnown
-                                        ? 'This chapter has no words.'
-                                        : 'All words in this chapter are marked known.',
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(
-                                  color: Colors.black54,
-                                  fontSize: 16,
-                                ),
-                              ),
-                            ),
-                          )
-                        : _isImageBook
-                            ? ListView(
-                                controller: _wordScrollController,
-                                padding: const EdgeInsets.fromLTRB(16, 4, 42, 112),
-                                children: [
-                                  for (final group in groupedWords!.entries)
-                                    Column(
-                                      key: _sectionKeys[group.key],
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Padding(
-                                          padding: const EdgeInsets.fromLTRB(
-                                              2, 12, 8, 8),
-                                          child: Row(
-                                            children: [
-                                              Container(
-                                                width: 32,
-                                                height: 32,
-                                                alignment: Alignment.center,
-                                                decoration: BoxDecoration(
-                                                  color: const Color(0xFFE4EFE8),
-                                                  borderRadius:
-                                                      BorderRadius.circular(10),
-                                                ),
-                                                child: Text(
-                                                  group.key,
-                                                  style: const TextStyle(
-                                                    color: Color(0xFF356859),
-                                                    fontSize: 16,
-                                                    fontWeight: FontWeight.w900,
-                                                  ),
-                                                ),
-                                              ),
-                                              const SizedBox(width: 10),
-                                              Expanded(
-                                                child: Divider(
-                                                  color: const Color(0xFF356859)
-                                                      .withOpacity(0.16),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                        for (final entry in group.value)
-                                          Padding(
-                                            padding: const EdgeInsets.only(
-                                                bottom: 8),
-                                            child: _wordCard(entry),
-                                          ),
-                                      ],
-                                    ),
-                                ],
-                              )
-                            : ListView.separated(
-                                controller: _wordScrollController,
-                                padding:
-                                    const EdgeInsets.fromLTRB(16, 4, 16, 100),
-                                itemCount: visible.length,
-                                separatorBuilder: (_, __) =>
-                                    const SizedBox(height: 8),
-                                itemBuilder: (_, index) =>
-                                    _wordCard(visible[index]),
-                              ),
-                  ),
-                ],
-              ),
-              if (_isImageBook && availableLetters.isNotEmpty)
-                Positioned(
-                  right: 1,
-                  top: 145,
-                  bottom: 92,
-                  child: AlphabetFastScroller(
-                    controller: _wordScrollController,
-                    names: availableLetters,
-                    itemExtent: 0,
-                    onLetterSelected: _scrollToLetter,
-                  ),
-                ),
-              Positioned(
-                left: 16,
-                bottom: 16,
-                child: Container(
-                  width: 150,
-                  height: 48,
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(30),
-                    border: Border.all(
-                      color: const Color(0xFF356859).withOpacity(0.3),
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withOpacity(0.08),
-                        blurRadius: 8,
-                        offset: const Offset(0, 4),
-                      ),
-                    ],
-                  ),
-                  child: Stack(
-                    alignment: Alignment.centerLeft,
-                    children: [
-                      const Padding(
-                        padding: EdgeInsets.only(left: 45),
-                        child: Text(
-                          'Slide to mark all →',
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w700,
-                            color: Color(0xFF356859),
-                          ),
-                        ),
-                      ),
-                      SliderTheme(
-                        data: SliderTheme.of(context).copyWith(
-                          trackHeight: 48,
-                          activeTrackColor: Colors.transparent,
-                          inactiveTrackColor: Colors.transparent,
-                          thumbColor: const Color(0xFF356859),
-                          thumbShape: const RoundSliderThumbShape(
-                            enabledThumbRadius: 22,
-                          ),
-                          overlayColor: Colors.transparent,
-                        ),
-                        child: Slider(
-                          value: _sliderValue,
-                          onChanged: (value) {
-                            setState(() => _sliderValue = value);
-                            if (value == 1.0) {
-                              widget.store.markAllChapterKnown(currentChapter);
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                  content: Text(
-                                    '✨ All eligible words marked known (Show Again protected)!',
-                                  ),
-                                  backgroundColor: Color(0xFF27845B),
-                                ),
-                              );
-                              Future.delayed(
-                                const Duration(milliseconds: 300),
-                                () {
-                                  if (mounted) {
-                                    setState(() => _sliderValue = 0.0);
-                                  }
-                                },
-                              );
-                            }
-                          },
-                        ),
-                      ),
-                    ],
-                  ),
+                    );
+                  },
                 ),
               ),
-              if (_isImageBook)
-                Positioned(
-                  right: 16,
-                  bottom: 16,
-                  child: _pageNavigation(),
-                ),
             ],
           ),
-        );
-      },
+          if (_isImageBook)
+            Positioned(
+              left: 16,
+              bottom: 16,
+              child: _MarkAllWordsSlider(
+                key: ValueKey('mark-all:${currentChapter.stableId}'),
+                store: widget.store,
+                chapter: currentChapter,
+              ),
+            ),
+          if (_isImageBook)
+            Positioned(
+              right: 16,
+              bottom: 16,
+              child: _pageNavigation(),
+            ),
+        ],
+      ),
+    );
+  }
+
+}
+
+
+class _SortableWordEntry {
+  const _SortableWordEntry(this.entry, this.sortKey);
+  final WordEntry entry;
+  final String sortKey;
+}
+
+class _VocabularySection {
+  const _VocabularySection({
+    required this.letter,
+    required this.words,
+    required this.startIndex,
+  });
+
+  final String? letter;
+  final List<WordEntry> words;
+  final int startIndex;
+  int get rowCount => words.length + (letter == null ? 0 : 1);
+}
+
+class _VocabularyListModel {
+  const _VocabularyListModel({
+    required this.sections,
+    required this.letterIndexes,
+    required this.itemCount,
+  });
+
+  final List<_VocabularySection> sections;
+  final Map<String, int> letterIndexes;
+  final int itemCount;
+
+  _VocabularyRow rowAt(int index, String chapterId) {
+    var low = 0;
+    var high = sections.length - 1;
+    while (low <= high) {
+      final middle = (low + high) >> 1;
+      final section = sections[middle];
+      if (index < section.startIndex) {
+        high = middle - 1;
+      } else if (index >= section.startIndex + section.rowCount) {
+        low = middle + 1;
+      } else {
+        final localIndex = index - section.startIndex;
+        if (section.letter != null && localIndex == 0) {
+          return _VocabularyRow.header(section.letter!);
+        }
+        final wordIndex = localIndex - (section.letter == null ? 0 : 1);
+        return _VocabularyRow.word(chapterId, section.words[wordIndex]);
+      }
+    }
+    throw RangeError.index(index, sections, 'index');
+  }
+}
+
+class _VocabularyRow {
+  const _VocabularyRow._({this.letter, this.entry, required this.key});
+
+  factory _VocabularyRow.header(String letter) => _VocabularyRow._(
+        letter: letter,
+        key: ValueKey<String>('header:$letter'),
+      );
+
+  factory _VocabularyRow.word(String chapterId, WordEntry entry) =>
+      _VocabularyRow._(
+        entry: entry,
+        key: ValueKey<String>(
+          'word:$chapterId:${BookStore.normalizeWord(entry.word)}',
+        ),
+      );
+
+  final String? letter;
+  final WordEntry? entry;
+  final Key key;
+}
+
+/// Keeps slider pointer updates local to this small widget. It never rebuilds
+/// the vocabulary list while the thumb is moving.
+class _MarkAllWordsSlider extends StatefulWidget {
+  const _MarkAllWordsSlider({
+    super.key,
+    required this.store,
+    required this.chapter,
+  });
+
+  final BookStore store;
+  final ChapterData chapter;
+
+  @override
+  State<_MarkAllWordsSlider> createState() => _MarkAllWordsSliderState();
+}
+
+class _MarkAllWordsSliderState extends State<_MarkAllWordsSlider> {
+  double _value = 0;
+  bool _busy = false;
+
+  Future<void> _finish(double value) async {
+    if (_busy || value < 0.995) return;
+    setState(() => _busy = true);
+    try {
+      await widget.store.markAllChapterKnown(widget.chapter);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            '✨ All eligible words marked known (Show Again protected)!',
+          ),
+          backgroundColor: Color(0xFF27845B),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _value = 0;
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 150,
+      height: 48,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(30),
+        border: Border.all(
+          color: const Color(0xFF356859).withOpacity(0.3),
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.08),
+            blurRadius: 8,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Stack(
+        alignment: Alignment.centerLeft,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(left: 45),
+            child: Text(
+              _busy ? 'Updating…' : 'Slide to mark all →',
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFF356859),
+              ),
+            ),
+          ),
+          SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              trackHeight: 48,
+              activeTrackColor: Colors.transparent,
+              inactiveTrackColor: Colors.transparent,
+              thumbColor: const Color(0xFF356859),
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 22),
+              overlayColor: Colors.transparent,
+            ),
+            child: Slider(
+              value: _value,
+              onChanged: _busy
+                  ? null
+                  : (value) => setState(() => _value = value),
+              onChangeEnd: _finish,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

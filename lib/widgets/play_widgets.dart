@@ -17,9 +17,10 @@ Future<void> startGame(
   BuildContext context,
   BookStore store,
   String title,
-  List<ChapterData> chapters,
-) async {
-  final counts = store.practiceCounts(chapters);
+  List<ChapterData> chapters, {
+  PracticeCounts? initialCounts,
+}) async {
+  final counts = initialCounts ?? store.practiceCounts(chapters);
   if (counts.total == 0) return;
 
   final choice = await showModalBottomSheet<PlayChoice>(
@@ -137,17 +138,17 @@ class PlayButton extends StatelessWidget {
     required this.title,
     required this.chapters,
     this.size = 32,
+    this.book,
   });
   final BookStore store;
   final String title;
   final List<ChapterData> chapters;
   final double size;
+  final BookData? book;
 
   static const _green = Color(0xFF356859);
 
-  @override
-  Widget build(BuildContext context) {
-    final counts = store.practiceCounts(chapters);
+  Widget _buildButton(BuildContext context, PracticeCounts counts) {
     final enabled = counts.total > 0;
     return IconButton(
       tooltip: enabled
@@ -158,8 +159,55 @@ class PlayButton extends StatelessWidget {
         size: size,
         color: enabled ? _green : _green.withOpacity(0.25),
       ),
-      onPressed:
-          enabled ? () => startGame(context, store, title, chapters) : null,
+      onPressed: enabled
+          ? () => startGame(
+                context,
+                store,
+                title,
+                chapters,
+                initialCounts: counts,
+              )
+          : null,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (book != null) {
+      // Whole-book statistics can cover hundreds of thousands of word
+      // entries. The shared Future yields between small chunks, so the list
+      // keeps responding while the index is prepared.
+      return ValueListenableBuilder<int>(
+        valueListenable: store.wordStateRevision,
+        builder: (context, _, __) => FutureBuilder<void>(
+          future: store.ensureBookWordCache(book!),
+          builder: (context, snapshot) {
+            final counts = store.cachedPracticeCountsForBook(book!);
+            if (counts == null) {
+              return SizedBox(
+                width: size + 16,
+                height: size + 16,
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: _green.withOpacity(0.65),
+                  ),
+                ),
+              );
+            }
+            return _buildButton(context, counts);
+          },
+        ),
+      );
+    }
+
+    return ValueListenableBuilder<int>(
+      valueListenable: store.wordStateRevision,
+      builder: (context, _, __) => _buildButton(
+        context,
+        store.practiceCounts(chapters),
+      ),
     );
   }
 }

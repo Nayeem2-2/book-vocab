@@ -56,30 +56,49 @@ class BookProgress extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final total = store.totalUniqueWords(book);
-    final known = store.knownCount(book);
-    final progress = total == 0 ? 0.0 : (known / total).clamp(0.0, 1.0).toDouble();
+    return ValueListenableBuilder<int>(
+      valueListenable: store.wordStateRevision,
+      builder: (context, _, __) => FutureBuilder<void>(
+        future: store.ensureBookWordCache(book),
+        builder: (context, snapshot) {
+          final ready = store.hasBookWordCache(book);
+          final total = ready ? store.totalUniqueWords(book) : 0;
+          final known = ready ? store.knownCount(book) : 0;
+          final progress = total == 0
+              ? 0.0
+              : (known / total).clamp(0.0, 1.0).toDouble();
 
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text('Book progress', style: TextStyle(fontWeight: FontWeight.w700)),
-                Text('$known / $total known', style: const TextStyle(color: Colors.black54, fontSize: 13)),
-              ],
+          return Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('Book progress',
+                          style: TextStyle(fontWeight: FontWeight.w700)),
+                      Text(
+                        ready ? '$known / $total known' : 'Calculating…',
+                        style: const TextStyle(
+                            color: Colors.black54, fontSize: 13),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(20),
+                    child: LinearProgressIndicator(
+                      value: ready ? progress : null,
+                      minHeight: 8,
+                    ),
+                  ),
+                ],
+              ),
             ),
-            const SizedBox(height: 10),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(20),
-              child: LinearProgressIndicator(value: progress, minHeight: 8),
-            ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }

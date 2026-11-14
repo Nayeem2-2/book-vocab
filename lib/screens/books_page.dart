@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:indexed_sliver_list/indexed_sliver_list.dart';
 
 import '../models/book_models.dart';
 import '../services/book_store.dart';
@@ -18,14 +21,49 @@ class BooksPage extends StatefulWidget {
 
 class _BooksPageState extends State<BooksPage> {
   final TextEditingController _searchController = TextEditingController();
-  final ScrollController _scrollController = ScrollController();
+  IndexedScrollController _scrollController = IndexedScrollController();
   final Set<String> _selectedBookIds = <String>{};
   String _query = '';
+  _BooksListData? _cachedListData;
+  Timer? _searchDebounce;
 
   bool get _selectionMode => _selectedBookIds.isNotEmpty;
 
   @override
+  void initState() {
+    super.initState();
+    widget.store.addListener(_onStoreStructureChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant BooksPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.store != widget.store) {
+      oldWidget.store.removeListener(_onStoreStructureChanged);
+      widget.store.addListener(_onStoreStructureChanged);
+      _cachedListData = null;
+      _replaceListController();
+    }
+  }
+
+  void _onStoreStructureChanged() {
+    // Structural changes can alter names, groups and measured row indexes.
+    _cachedListData = null;
+    _replaceListController();
+  }
+
+  void _replaceListController() {
+    final oldController = _scrollController;
+    _scrollController = IndexedScrollController();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      oldController.dispose();
+    });
+  }
+
+  @override
   void dispose() {
+    widget.store.removeListener(_onStoreStructureChanged);
+    _searchDebounce?.cancel();
     _searchController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -198,15 +236,30 @@ class _BooksPageState extends State<BooksPage> {
     );
   }
 
+  void _scheduleSearch(String value) {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 140), () {
+      if (!mounted || value == _query) return;
+      _cachedListData = null;
+      _replaceListController();
+      setState(() => _query = value);
+    });
+  }
+
+  void _clearSearch() {
+    _searchDebounce?.cancel();
+    _searchController.clear();
+    _cachedListData = null;
+    _replaceListController();
+    setState(() => _query = '');
+  }
+
   Widget _searchField() {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
       child: TextField(
         controller: _searchController,
-        onChanged: (value) {
-          if (_scrollController.hasClients) _scrollController.jumpTo(0);
-          setState(() => _query = value);
-        },
+        onChanged: _scheduleSearch,
         textInputAction: TextInputAction.search,
         decoration: InputDecoration(
           hintText: 'Search books...',
@@ -215,11 +268,7 @@ class _BooksPageState extends State<BooksPage> {
               ? null
               : IconButton(
                   tooltip: 'Clear search',
-                  onPressed: () {
-                    _searchController.clear();
-                    if (_scrollController.hasClients) _scrollController.jumpTo(0);
-                    setState(() => _query = '');
-                  },
+                  onPressed: _clearSearch,
                   icon: const Icon(Icons.close),
                 ),
           filled: true,
@@ -275,12 +324,27 @@ class _BooksPageState extends State<BooksPage> {
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontWeight: FontWeight.w700),
             ),
-            subtitle: Padding(
-              padding: const EdgeInsets.only(top: 5),
-              child: Text(
-                '${book.isImageBook ? '${book.pages.length} Pages' : '${book.parts.length} Parts'}  •  ${widget.store.totalUniqueWords(book)} unique words\n${widget.store.knownCount(book)} known',
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
+            subtitle: ValueListenableBuilder<int>(
+              valueListenable: widget.store.wordStateRevision,
+              builder: (context, _, __) => FutureBuilder<void>(
+                future: widget.store.ensureBookWordCache(book),
+                builder: (context, snapshot) {
+                  final structureLabel = book.isImageBook
+                      ? '${book.pages.length} Pages'
+                      : '${book.parts.length} Parts';
+                  final statsReady = widget.store.hasBookWordCache(book);
+                  final subtitle = statsReady
+                      ? '$structureLabel  •  ${widget.store.totalUniqueWords(book)} unique words\n${widget.store.knownCount(book)} known'
+                      : '$structureLabel  •  Preparing vocabulary statistics…';
+                  return Padding(
+                    padding: const EdgeInsets.only(top: 5),
+                    child: Text(
+                      subtitle,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  );
+                },
               ),
             ),
             isThreeLine: true,
@@ -294,6 +358,7 @@ class _BooksPageState extends State<BooksPage> {
                         title: book.name,
                         chapters: book.allChapters,
                         size: 32,
+                        book: book,
                       ),
                       PopupMenuButton<String>(
                         tooltip: 'Book options',
@@ -333,10 +398,42 @@ class _BooksPageState extends State<BooksPage> {
     for (final book in books) {
       final trimmed = book.name.trim();
       final initial = trimmed.isEmpty ? '#' : trimmed[0].toUpperCase();
-      final letter = RegExp(r'^[A-Z]$').hasMatch(initial) ? initial : '#';
+      final letter = isEnglishAlphabetLetter(initial) ? initial : '#';
       groups.putIfAbsent(letter, () => <BookData>[]).add(book);
     }
     return groups;
+  }
+
+  _BooksListData _listData() {
+    final cached = _cachedListData;
+    if (cached != null && cached.query == _query) return cached;
+
+    final filteredBooks = rankAndSortByName<BookData>(
+      widget.store.books,
+      (book) => book.name,
+      _query,
+    );
+    final groupedBooks = _groupBooksByInitial(filteredBooks);
+    final rows = <Object>[];
+    final sectionIndexes = <String, int>{};
+    for (final group in groupedBooks.entries) {
+      sectionIndexes[group.key] = rows.length;
+      rows.add(group.key);
+      rows.addAll(group.value);
+    }
+    final indexLetters = groupedBooks.keys
+        .where((letter) => isEnglishAlphabetLetter(letter))
+        .toList(growable: false);
+
+    final data = _BooksListData(
+      query: _query,
+      filteredBooks: filteredBooks,
+      rows: rows,
+      sectionIndexes: sectionIndexes,
+      indexLetters: indexLetters,
+    );
+    _cachedListData = data;
+    return data;
   }
 
   Widget _letterHeader(String letter) {
@@ -376,27 +473,11 @@ class _BooksPageState extends State<BooksPage> {
     return AnimatedBuilder(
       animation: widget.store,
       builder: (context, _) {
-        final filteredBooks = rankAndSortByName<BookData>(
-          widget.store.books,
-          (book) => book.name,
-          _query,
-        );
-        final groupedBooks = _groupBooksByInitial(filteredBooks);
-        final rows = <Object>[];
-        final sectionOffsets = <String, double>{};
-        var contentOffset = 0.0;
-        for (final group in groupedBooks.entries) {
-          sectionOffsets[group.key] = contentOffset;
-          rows.add(group.key);
-          contentOffset += 36;
-          for (final book in group.value) {
-            rows.add(book);
-            contentOffset += 112;
-          }
-        }
-        final indexLetters = groupedBooks.keys
-            .where((letter) => RegExp(r'^[A-Z]$').hasMatch(letter))
-            .toList();
+        final listData = _listData();
+        final filteredBooks = listData.filteredBooks;
+        final rows = listData.rows;
+        final sectionIndexes = listData.sectionIndexes;
+        final indexLetters = listData.indexLetters;
 
         return Scaffold(
           appBar: AppBar(
@@ -477,10 +558,12 @@ class _BooksPageState extends State<BooksPage> {
                     : Stack(
                         children: [
                           Positioned.fill(
-                            child: ListView.builder(
+                            child: IndexedListView(
                               controller: _scrollController,
                               padding: const EdgeInsets.fromLTRB(12, 0, 27, 100),
                               itemCount: rows.length,
+                              estimatedItemExtent: 108,
+                              addAutomaticKeepAlives: false,
                               itemBuilder: (context, index) {
                                 final row = rows[index];
                                 return row is String
@@ -499,18 +582,14 @@ class _BooksPageState extends State<BooksPage> {
                                 names: indexLetters,
                                 itemExtent: 0,
                                 onLetterSelected: (letter) {
-                                  final target = sectionOffsets[letter];
+                                  final target = sectionIndexes[letter];
                                   if (target == null || !_scrollController.hasClients) {
                                     return;
                                   }
-                                  _scrollController.animateTo(
-                                    target.clamp(
-                                      0.0,
-                                      _scrollController.position.maxScrollExtent,
-                                    ).toDouble(),
-                                    duration: const Duration(milliseconds: 110),
-                                    curve: Curves.easeOutCubic,
-                                  );
+                                  unawaited(_scrollController.jumpToIndex(
+                                    target,
+                                    alignment: 0,
+                                  ));
                                 },
                               ),
                             ),
@@ -551,4 +630,21 @@ class _EmptyState extends StatelessWidget {
           ),
         ),
       );
+}
+
+
+class _BooksListData {
+  const _BooksListData({
+    required this.query,
+    required this.filteredBooks,
+    required this.rows,
+    required this.sectionIndexes,
+    required this.indexLetters,
+  });
+
+  final String query;
+  final List<BookData> filteredBooks;
+  final List<Object> rows;
+  final Map<String, int> sectionIndexes;
+  final List<String> indexLetters;
 }
