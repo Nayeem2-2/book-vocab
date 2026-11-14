@@ -7,7 +7,8 @@ import '../models/book_models.dart';
 import '../services/book_store.dart';
 import '../services/image_page_importer.dart';
 import '../widgets/alphabet_fast_scroller.dart';
-import '../widgets/name_input_dialog.dart';
+import '../widgets/page_details_dialog.dart';
+import '../widgets/page_number_fast_scroller.dart';
 import '../widgets/play_widgets.dart';
 import 'chapter_page.dart';
 
@@ -27,7 +28,12 @@ class _PagesPageState extends State<PagesPage> {
   String _query = '';
   bool busy = false;
   _PagesListData? _cachedListData;
+  List<ChapterData>? _orderedPagesCache;
   Timer? _searchDebounce;
+  int _listControllerGeneration = 0;
+  int? _pendingPageJump;
+  int _pageJumpTicket = 0;
+  bool _pageJumpScheduled = false;
 
   bool get _selectionMode => _selectedPageIds.isNotEmpty;
 
@@ -40,22 +46,51 @@ class _PagesPageState extends State<PagesPage> {
   @override
   void didUpdateWidget(covariant PagesPage oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.store != widget.store) {
+    final storeChanged = oldWidget.store != widget.store;
+    final bookChanged = oldWidget.book.id != widget.book.id;
+
+    if (storeChanged) {
       oldWidget.store.removeListener(_onStoreStructureChanged);
       widget.store.addListener(_onStoreStructureChanged);
+    }
+
+    if (storeChanged || bookChanged) {
       _cachedListData = null;
+      _orderedPagesCache = null;
+      _selectedPageIds.clear();
+      _query = '';
+      _searchController.clear();
       _replaceListController();
     }
   }
 
   void _onStoreStructureChanged() {
+    // The page directory is kept mounted underneath the vocabulary route.
+    // Invalidate it whenever the book structure changes so it is already
+    // current when the user returns.
     _cachedListData = null;
+    _orderedPagesCache = null;
     _replaceListController();
   }
 
+  void _refreshPagesAfterVocabularyRoute() {
+    if (!mounted) return;
+    _cachedListData = null;
+    _orderedPagesCache = null;
+    // Page additions already notify the store while this route is underneath
+    // the vocabulary screen, so the structural listener replaces the indexed
+    // controller when needed. Do not reset it again here: returning from a
+    // vocabulary page without changing the list should preserve scroll offset.
+    setState(() {});
+  }
+
   void _replaceListController() {
+    _pageJumpTicket++;
+    _pageJumpScheduled = false;
+    _pendingPageJump = null;
     final oldController = _scrollController;
     _scrollController = IndexedScrollController();
+    _listControllerGeneration++;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       oldController.dispose();
     });
@@ -102,7 +137,9 @@ class _PagesPageState extends State<PagesPage> {
         book: widget.book,
       );
       if (added.isNotEmpty) {
+        _cachedListData = null;
         _message('${added.length} page(s) added and processed.');
+        if (mounted) setState(() {});
       }
     } catch (error) {
       _message('Could not add page: $error');
@@ -124,23 +161,29 @@ class _PagesPageState extends State<PagesPage> {
     setState(_selectedPageIds.clear);
   }
 
-  Future<void> _rename(ChapterData page) async {
-    final name = await showDialog<String>(
+  Future<void> _editPageDetails(ChapterData page) async {
+    final details = await showDialog<PageDetailsInput>(
       context: context,
-      builder: (_) => NameInputDialog(
-        title: 'Rename page',
-        label: 'Page name',
-        initialValue: page.title,
-        submitLabel: 'Save',
+      builder: (_) => PageDetailsDialog(
+        page: page,
+        pages: widget.book.pages,
       ),
     );
-    if (!mounted || name == null || name.trim().isEmpty) return;
+    if (!mounted || details == null) return;
 
     try {
-      await widget.store.renamePage(widget.book, page, name);
-      _message('Page renamed');
+      await widget.store.updatePageDetails(
+        widget.book,
+        page,
+        name: details.name,
+        pageNumber: details.pageNumber,
+      );
+      if (!mounted) return;
+      _cachedListData = null;
+      _message('Saved as \"${page.title}\" • Page ${page.pageNumber}');
+      setState(() {});
     } catch (error) {
-      _message('Could not rename page: $error');
+      _message('Could not update page: $error');
     }
   }
 
@@ -180,7 +223,10 @@ class _PagesPageState extends State<PagesPage> {
     }
   }
 
-  void _openPage(ChapterData page, List<ChapterData> orderedPages) {
+  Future<void> _openPage(
+    ChapterData page,
+    List<ChapterData> orderedPages,
+  ) async {
     if (_selectionMode) {
       _togglePageSelection(page);
       return;
@@ -191,9 +237,9 @@ class _PagesPageState extends State<PagesPage> {
     );
     if (pageIndex < 0) return;
 
-    Navigator.push(
+    await Navigator.push<void>(
       context,
-      MaterialPageRoute(
+      MaterialPageRoute<void>(
         settings: RouteSettings(
           name: 'vocabulary:${widget.book.id}:${page.stableId}',
         ),
@@ -206,6 +252,11 @@ class _PagesPageState extends State<PagesPage> {
         ),
       ),
     );
+
+    // Force a fresh numeric order after returning from vocabulary. The store
+    // listener normally invalidates this already, but the explicit return
+    // refresh also covers route transitions and batched imports.
+    _refreshPagesAfterVocabularyRoute();
   }
 
   void _scheduleSearch(String value) {
@@ -234,7 +285,7 @@ class _PagesPageState extends State<PagesPage> {
         onChanged: _scheduleSearch,
         textInputAction: TextInputAction.search,
         decoration: InputDecoration(
-          hintText: 'Search pages...',
+          hintText: 'Search page number or name...',
           prefixIcon: const Icon(Icons.search),
           suffixIcon: _query.isEmpty
               ? null
@@ -259,79 +310,64 @@ class _PagesPageState extends State<PagesPage> {
     );
   }
 
-  Map<String, List<ChapterData>> _groupPagesByInitial(
-    List<ChapterData> pages,
-  ) {
-    final groups = <String, List<ChapterData>>{};
-    for (final page in pages) {
-      final trimmed = page.title.trim();
-      final initial = trimmed.isEmpty ? '#' : trimmed[0].toUpperCase();
-      final letter = isEnglishAlphabetLetter(initial) ? initial : '#';
-      groups.putIfAbsent(letter, () => <ChapterData>[]).add(page);
-    }
-    return groups;
-  }
+  List<ChapterData> _orderedPagesByNumber() {
+    final cached = _orderedPagesCache;
+    if (cached != null) return cached;
 
-  Widget _letterHeader(String letter) {
-    return SizedBox(
-      height: 32,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 6, 12, 2),
-        child: Row(
-          children: [
-            Text(
-              letter,
-              style: const TextStyle(
-                color: Color(0xFF356859),
-                fontSize: 13,
-                fontWeight: FontWeight.w900,
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Divider(color: const Color(0xFF356859).withOpacity(0.18)),
-            ),
-          ],
-        ),
-      ),
-    );
+    // Stable tie-breaker: pages with equal numbers keep scan/import order.
+    final indexed = widget.book.pages.asMap().entries.toList(growable: false);
+    final numberedPages = indexed.toList()
+      ..sort((a, b) {
+        final numberOrder = a.value.pageNumber.compareTo(b.value.pageNumber);
+        return numberOrder != 0 ? numberOrder : a.key.compareTo(b.key);
+      });
+    final ordered = numberedPages
+        .map((entry) => entry.value)
+        .toList(growable: false);
+    _orderedPagesCache = ordered;
+    return ordered;
   }
 
   _PagesListData _listData() {
     final cached = _cachedListData;
     if (cached != null && cached.query == _query) return cached;
 
-    // This order is used for Previous/Next after entering from the Pages list.
-    final alphabeticalPages = List<ChapterData>.from(widget.book.pages)
-      ..sort((a, b) => a.title.trim().toLowerCase().compareTo(
-            b.title.trim().toLowerCase(),
-          ));
-    final visiblePages = _query.trim().isEmpty
-        ? alphabeticalPages
-        : rankAndSortByName<ChapterData>(
-            widget.book.pages,
-            (page) => page.title,
-            _query,
-          );
-    final groupedPages = _groupPagesByInitial(visiblePages);
-    final rows = <Object>[];
-    final sectionIndexes = <String, int>{};
-    for (final group in groupedPages.entries) {
-      sectionIndexes[group.key] = rows.length;
-      rows.add(group.key);
-      rows.addAll(group.value);
+    // Cached separately from search results: typing a query never re-sorts
+    // thousands of page records. The order remains number first, scan order
+    // for ties, and never mutates book.pages itself.
+    final orderedPages = _orderedPagesByNumber();
+
+    final normalizedQuery = _query.trim();
+    List<ChapterData> visiblePages;
+    final requestedNumber = int.tryParse(normalizedQuery);
+    if (normalizedQuery.isEmpty) {
+      visiblePages = orderedPages;
+    } else if (requestedNumber != null) {
+      final numberMatches = orderedPages
+          .where((page) => page.pageNumber == requestedNumber)
+          .toList(growable: false);
+      visiblePages = numberMatches.isNotEmpty
+          ? numberMatches
+          : rankAndSortByName<ChapterData>(
+              orderedPages,
+              (page) => page.title,
+              normalizedQuery,
+            );
+    } else {
+      visiblePages = rankAndSortByName<ChapterData>(
+        orderedPages,
+        (page) => page.title,
+        normalizedQuery,
+      );
     }
-    final indexLetters = groupedPages.keys
-        .where((letter) => isEnglishAlphabetLetter(letter))
-        .toList(growable: false);
 
     final data = _PagesListData(
       query: _query,
-      alphabeticalPages: alphabeticalPages,
+      orderedPages: orderedPages,
       visiblePages: visiblePages,
-      rows: rows,
-      sectionIndexes: sectionIndexes,
-      indexLetters: indexLetters,
+      visiblePageNumbers: visiblePages
+          .map((page) => page.pageNumber)
+          .toList(growable: false),
     );
     _cachedListData = data;
     return data;
@@ -357,13 +393,23 @@ class _PagesPageState extends State<PagesPage> {
                     size: 27,
                   )
                 : Container(
-                    width: 42,
+                    width: 48,
                     height: 48,
+                    alignment: Alignment.center,
                     decoration: BoxDecoration(
                       color: const Color(0xFFE8F1EC),
                       borderRadius: BorderRadius.circular(10),
                     ),
-                    child: const Icon(Icons.description_outlined, color: Color(0xFF356859)),
+                    child: Text(
+                      '${page.pageNumber}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Color(0xFF356859),
+                        fontSize: 17,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
                   ),
             title: Text(
               page.title,
@@ -371,7 +417,7 @@ class _PagesPageState extends State<PagesPage> {
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontWeight: FontWeight.w700),
             ),
-            subtitle: Text('${page.words.length} distinct words'),
+            subtitle: Text('Page number ${page.pageNumber}  •  ${page.words.length} distinct words'),
             trailing: _selectionMode
                 ? const SizedBox(width: 4)
                 : Row(
@@ -386,16 +432,16 @@ class _PagesPageState extends State<PagesPage> {
                       PopupMenuButton<String>(
                         tooltip: 'Page options',
                         onSelected: (value) {
-                          if (value == 'rename') _rename(page);
+                          if (value == 'edit') _editPageDetails(page);
                           if (value == 'delete') _confirmDeletePages([page]);
                         },
                         itemBuilder: (_) => const [
                           PopupMenuItem(
-                            value: 'rename',
+                            value: 'edit',
                             child: ListTile(
                               contentPadding: EdgeInsets.zero,
                               leading: Icon(Icons.edit_outlined),
-                              title: Text('Rename'),
+                              title: Text('Edit name & number'),
                             ),
                           ),
                           PopupMenuItem(
@@ -416,19 +462,57 @@ class _PagesPageState extends State<PagesPage> {
     );
   }
 
+  void _queuePageListJump(int index) {
+    final itemCount = _listData().visiblePages.length;
+    if (itemCount == 0 || !_scrollController.hasClients) return;
+    _pendingPageJump = index.clamp(0, itemCount - 1).toInt();
+    if (_pageJumpScheduled) return;
+
+    _pageJumpScheduled = true;
+    final ticket = _pageJumpTicket;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _pageJumpScheduled = false;
+      if (!mounted || ticket != _pageJumpTicket ||
+          !_scrollController.hasClients) {
+        return;
+      }
+      final target = _pendingPageJump;
+      if (target == null) return;
+      // Coalesce all finger updates received during one frame into a single
+      // indexed jump. This keeps the slider responsive with thousands of pages.
+      unawaited(_scrollController.jumpToIndex(target).catchError((_) {}));
+    });
+  }
+
+  void _settlePageListJump(int index) {
+    final itemCount = _listData().visiblePages.length;
+    if (!mounted || itemCount == 0 || !_scrollController.hasClients) return;
+    // Invalidate any queued per-frame jump and perform one short, restrained
+    // animation to settle exactly on the final requested page.
+    _pageJumpTicket++;
+    _pageJumpScheduled = false;
+    _pendingPageJump = null;
+    final target = index.clamp(0, itemCount - 1).toInt();
+    unawaited(
+      _scrollController
+          .animateToIndex(
+            target,
+            duration: const Duration(milliseconds: 90),
+            curve: Curves.easeOutCubic,
+            alignment: 0,
+          )
+          .catchError((_) {}),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: widget.store,
       builder: (context, _) {
-        // Cached separately from selection state so long-press/tap selection
-        // never repeats the full-page sort and grouping operation.
         final listData = _listData();
-        final alphabeticalPages = listData.alphabeticalPages;
+        final orderedPages = listData.orderedPages;
         final visiblePages = listData.visiblePages;
-        final rows = listData.rows;
-        final sectionIndexes = listData.sectionIndexes;
-        final indexLetters = listData.indexLetters;
 
         return Scaffold(
           appBar: AppBar(
@@ -541,42 +625,29 @@ class _PagesPageState extends State<PagesPage> {
                             children: [
                               Positioned.fill(
                                 child: IndexedListView(
+                                  key: ValueKey('page-list:${widget.book.id}:${visiblePages.length}:${_query}:$_listControllerGeneration'),
                                   controller: _scrollController,
-                                  padding: const EdgeInsets.fromLTRB(12, 0, 27, 100),
-                                  itemCount: rows.length,
+                                  padding: const EdgeInsets.fromLTRB(12, 0, 42, 100),
+                                  itemCount: visiblePages.length,
                                   estimatedItemExtent: 88,
                                   addAutomaticKeepAlives: false,
-                                  itemBuilder: (context, index) {
-                                    final row = rows[index];
-                                    return row is String
-                                        ? _letterHeader(row)
-                                        : _pageTile(
-                                            row as ChapterData,
-                                            alphabeticalPages,
-                                          );
-                                  },
+                                  itemBuilder: (context, index) => _pageTile(
+                                    visiblePages[index],
+                                    orderedPages,
+                                  ),
                                 ),
                               ),
-                              if (indexLetters.isNotEmpty)
+                              if (!_selectionMode && visiblePages.length > 1)
                                 Positioned(
                                   right: 1,
-                                  top: 4,
+                                  top: 8,
                                   bottom: 104,
-                                  child: AlphabetFastScroller(
+                                  child: PageNumberFastScroller(
                                     controller: _scrollController,
-                                    names: indexLetters,
-                                    itemExtent: 0,
-                                    onLetterSelected: (letter) {
-                                      final target = sectionIndexes[letter];
-                                      if (target == null ||
-                                          !_scrollController.hasClients) {
-                                        return;
-                                      }
-                                      unawaited(_scrollController.jumpToIndex(
-                                        target,
-                                        alignment: 0,
-                                      ));
-                                    },
+                                    itemCount: visiblePages.length,
+                                    pageNumbers: listData.visiblePageNumbers,
+                                    onIndexChanged: _queuePageListJump,
+                                    onDragEnd: _settlePageListJump,
                                   ),
                                 ),
                             ],
@@ -594,17 +665,13 @@ class _PagesPageState extends State<PagesPage> {
 class _PagesListData {
   const _PagesListData({
     required this.query,
-    required this.alphabeticalPages,
+    required this.orderedPages,
     required this.visiblePages,
-    required this.rows,
-    required this.sectionIndexes,
-    required this.indexLetters,
+    required this.visiblePageNumbers,
   });
 
   final String query;
-  final List<ChapterData> alphabeticalPages;
+  final List<ChapterData> orderedPages;
   final List<ChapterData> visiblePages;
-  final List<Object> rows;
-  final Map<String, int> sectionIndexes;
-  final List<String> indexLetters;
+  final List<int> visiblePageNumbers;
 }

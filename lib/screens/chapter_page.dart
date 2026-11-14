@@ -24,7 +24,7 @@ class ChapterPage extends StatefulWidget {
   final BookData book;
   final ChapterData chapter;
 
-  /// Ordering is intentional: Pages-list entry supplies alphabetical order;
+  /// Ordering is intentional: Pages-list entry supplies page-number order;
   /// adding a page from this screen switches this list to scan/import order.
   final List<ChapterData> pages;
   final int pageIndex;
@@ -150,16 +150,18 @@ class _ChapterPageState extends State<ChapterPage> {
       if (!mounted || added.isEmpty) return;
 
       final scanOrder = List<ChapterData>.from(widget.book.pages);
-      final newestId = added.last.stableId;
-      final newestIndex = scanOrder.indexWhere(
-        (page) => page.stableId == newestId,
+      // After importing a batch, open its first page in the original
+      // scanning/import order (not the last imported page).
+      final firstAddedId = added.first.stableId;
+      final firstAddedIndex = scanOrder.indexWhere(
+        (page) => page.stableId == firstAddedId,
       );
-      if (newestIndex >= 0) {
+      if (firstAddedIndex >= 0) {
         _searchDebounce?.cancel();
         _resetWordScrollController();
         setState(() {
           _navigationPages = scanOrder;
-          _currentIndex = newestIndex;
+          _currentIndex = firstAddedIndex;
           query = '';
           _queryController.clear();
         });
@@ -604,10 +606,31 @@ class _ChapterPageState extends State<ChapterPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          currentChapter.title,
-          style: const TextStyle(fontWeight: FontWeight.w800),
-        ),
+        title: _isImageBook
+            ? Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    currentChapter.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  Text(
+                    'Page ${currentChapter.pageNumber}',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              )
+            : Text(
+                currentChapter.title,
+                style: const TextStyle(fontWeight: FontWeight.w800),
+              ),
         actions: [
           if (currentChapter.imagePath != null)
             IconButton(

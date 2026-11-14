@@ -67,10 +67,30 @@ class BookStore extends ChangeNotifier {
           for (var pageIndex = 0; pageIndex < rawPages.length; pageIndex++) {
             final page = Map<String, dynamic>.from(rawPages[pageIndex] as Map);
             final imagePath = page['imagePath']?.toString();
+            final savedName = (page['name'] ?? '').toString().trim();
+            final legacyNameMatch = RegExp(
+              r'^Page[- ](\d+)(?: \((\d+)\))?$',
+              caseSensitive: false,
+            ).firstMatch(savedName);
+            final savedNumber = int.tryParse(page['pageNumber']?.toString() ?? '');
+            final pageNumber = savedNumber != null && savedNumber > 0
+                ? savedNumber
+                : int.tryParse(legacyNameMatch?.group(1) ?? '') ?? pageIndex + 1;
+            // Convert the old generated "Page-1" label to the new default
+            // "Page 1" label. Custom page names remain untouched.
+            final savedDefaultName = page['isDefaultName'] as bool?;
+            final isDefaultName = savedDefaultName ??
+                (legacyNameMatch != null || savedName.isEmpty);
+            final legacySuffix = legacyNameMatch?.group(2);
+            final pageName = legacyNameMatch == null
+                ? (savedName.isEmpty ? 'Page $pageNumber' : savedName)
+                : 'Page $pageNumber${legacySuffix == null ? '' : ' ($legacySuffix)'}';
             pages.add(ChapterData(
               id: (page['id'] ?? imagePath ?? '${id}_$pageIndex').toString(),
-              title: (page['name'] ?? 'Page').toString(),
+              title: pageName,
               pageRange: '',
+              pageNumber: pageNumber,
+              isDefaultName: isDefaultName,
               imagePath: imagePath,
               words: (page['words'] as List? ?? const [])
                   .map((w) => WordEntry.fromJson(Map<String, dynamic>.from(w)))
@@ -724,6 +744,8 @@ class BookStore extends ChangeNotifier {
           .map((page) => {
                 'id': page.stableId,
                 'name': page.title,
+                'pageNumber': page.pageNumber,
+                'isDefaultName': page.isDefaultName,
                 'imagePath': page.imagePath,
                 'words': page.words.map((word) => word.toJson()).toList(),
               })
@@ -737,35 +759,78 @@ class BookStore extends ChangeNotifier {
     );
   }
 
-  Future<void> addScannedPage(BookData book, Uint8List bytes) async {
-    if (!book.isImageBook) throw Exception('Pages can only be added to an image book.');
+  Future<void> addScannedPage(
+    BookData book,
+    Uint8List bytes, {
+    bool notify = true,
+  }) async {
+    if (!book.isImageBook) {
+      throw Exception('Pages can only be added to an image book.');
+    }
     if (!dictionary.isLoaded) await dictionary.load();
+
     final decoded = img.decodeImage(bytes);
     if (decoded == null) throw Exception('This image format could not be opened.');
-    final jpg = img.encodeJpg(decoded, quality: 90);
-    var number = book.pages.length + 1;
-    final existingNames = book.pages.map((p) => p.title).toSet();
-    while (existingNames.contains('Page-$number')) { number++; }
+
+    // Page numbers are independent from list length. After manual renumbering,
+    // the next imported page is always highest existing number + 1.
+    final highestNumber = book.pages.fold<int>(
+      0,
+      (highest, page) => page.pageNumber > highest ? page.pageNumber : highest,
+    );
+    final pageNumber = highestNumber + 1;
+    final pageName = _uniquePageName(book, 'Page $pageNumber');
     final pageId = DateTime.now().microsecondsSinceEpoch.toString();
-    final imagePath = '${File(book.jsonPath).parent.path}/pages/page_$pageId.jpg';
+    final jpg = img.encodeJpg(decoded, quality: 90);
+    final imagePath =
+        '${File(book.jsonPath).parent.path}/pages/page_$pageId.jpg';
+
     await File(imagePath).writeAsBytes(jpg, flush: true);
     try {
       final words = await _ocr.extractWords(imagePath, dictionary);
       book.pages.add(ChapterData(
         id: pageId,
-        title: 'Page-$number',
+        title: pageName,
+        pageNumber: pageNumber,
+        isDefaultName: true,
         pageRange: '',
         words: words,
         imagePath: imagePath,
       ));
       await _saveImageMetadata(book);
-      _invalidateBookWordCache(book.id);
-      _clearPracticeScopeCaches();
-      notifyListeners();
+      if (notify) notifyImageBookPagesChanged(book);
     } catch (_) {
+      book.pages.removeWhere((page) => page.stableId == pageId);
       await File(imagePath).delete().catchError((_) => File(imagePath));
       rethrow;
     }
+  }
+
+  /// Called once after a multi-image import so the Pages route refreshes once,
+  /// not once for every scanned page in the batch.
+  void notifyImageBookPagesChanged(BookData book) {
+    _invalidateBookWordCache(book.id);
+    _clearPracticeScopeCaches();
+    notifyListeners();
+  }
+
+  String _uniquePageName(
+    BookData book,
+    String requestedName, {
+    String? excludingPageId,
+  }) {
+    final base = requestedName.trim();
+    final existingNames = book.pages
+        .where((page) => page.stableId != excludingPageId)
+        .map((page) => page.title.trim().toLowerCase())
+        .toSet();
+    if (!existingNames.contains(base.toLowerCase())) return base;
+
+    var suffix = 1;
+    while (existingNames.contains('$base ($suffix)'.toLowerCase())) {
+      suffix++;
+    }
+    return '$base ($suffix)';
   }
 
   Future<void> renameBook(BookData book, String name) async {
@@ -786,18 +851,56 @@ class BookStore extends ChangeNotifier {
   }
 
   Future<void> renamePage(BookData book, ChapterData page, String name) async {
+    await updatePageDetails(
+      book,
+      page,
+      name: name,
+      pageNumber: page.pageNumber,
+    );
+  }
+
+  /// Updates a page's display name and page number without changing its stable
+  /// identity, image path, vocabulary, or position in the original scan order.
+  /// Duplicate page numbers are permitted; duplicate names are auto-suffixed.
+  Future<void> updatePageDetails(
+    BookData book,
+    ChapterData page, {
+    required String name,
+    required int pageNumber,
+  }) async {
     final clean = name.trim();
     if (clean.isEmpty) throw Exception('Page name cannot be empty.');
+    if (pageNumber < 1) throw Exception('Page number must be 1 or greater.');
+
     final index = book.pages.indexWhere(
       (candidate) => candidate.stableId == page.stableId,
     );
     if (index < 0) return;
 
-    // Update the existing model instead of replacing it. Existing routes,
-    // selection sets and widgets therefore keep referring to the same page.
-    book.pages[index].title = clean;
+    final current = book.pages[index];
+    final numberChanged = current.pageNumber != pageNumber;
+    final nameUnchanged = clean == current.title;
+    final requestedName = current.isDefaultName && nameUnchanged && numberChanged
+        ? 'Page $pageNumber'
+        : clean;
+    final uniqueName = _uniquePageName(
+      book,
+      requestedName,
+      excludingPageId: page.stableId,
+    );
+    final defaultNameMatch = RegExp(
+      '^Page ${RegExp.escape(pageNumber.toString())}(?: \\(\\d+\\))?\$',
+      caseSensitive: false,
+    ).hasMatch(requestedName);
+
+    // Preserve the original ChapterData object so open routes and selection
+    // sets continue to refer to the same scanned page.
+    current.title = uniqueName;
+    current.pageNumber = pageNumber;
+    current.isDefaultName = current.isDefaultName && nameUnchanged && numberChanged
+        ? true
+        : defaultNameMatch;
     await _saveImageMetadata(book);
-    // Renaming changes the alphabetical page index, not the vocabulary cache.
     notifyListeners();
   }
 

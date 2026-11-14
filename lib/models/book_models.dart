@@ -21,6 +21,8 @@ class ChapterData {
     required this.words,
     this.imagePath,
     this.id,
+    this.pageNumber = 1,
+    this.isDefaultName = false,
   });
 
   // Mutable so renaming a page preserves its identity and all live references.
@@ -29,6 +31,13 @@ class ChapterData {
   final List<WordEntry> words;
   final String? imagePath;
   final String? id;
+
+  /// User-editable page number for image-book pages. JSON-book chapters ignore it.
+  int pageNumber;
+
+  /// True when title was generated from the page number by the app.
+  /// Renumbering can safely keep these default titles in sync.
+  bool isDefaultName;
 
   /// Stable identity for image pages, including pages loaded from older metadata.
   String get stableId => id ?? imagePath ?? '$title|$pageRange';

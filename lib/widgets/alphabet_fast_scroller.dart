@@ -54,7 +54,8 @@ List<T> rankAndSortByName<T>(
   return ranked.map((item) => item.value).toList(growable: false);
 }
 
-/// Alphabetical fast-scroll rail used by Books, Pages and page vocabulary.
+/// Alphabetical fast-scroll rail used by Books and page vocabulary.
+/// The Pages directory uses a numeric fast-scroller instead.
 ///
 /// The rail stays subtly visible when idle. During touch/drag it becomes fully
 /// visible and displays a five-letter focal preview around the active letter.

@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 import '../models/book_models.dart';
 
 /// Full-screen image viewer. Its page sequence is inherited from the active
-/// vocabulary navigation mode (alphabetical or original scan/import order).
+/// vocabulary navigation mode (page-number or original scan/import order).
 class ImageViewerPage extends StatefulWidget {
   const ImageViewerPage({
     super.key,
@@ -59,12 +59,24 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
       appBar: AppBar(
         backgroundColor: const Color(0xFF171A18),
         foregroundColor: Colors.white,
-        title: Text(
-          page?.title ?? 'Page image',
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontWeight: FontWeight.w700),
-        ),
+        title: page == null
+            ? const Text('Page image')
+            : Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    page.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  Text(
+                    'Page ${page.pageNumber}',
+                    style: const TextStyle(fontSize: 11, color: Colors.white70),
+                  ),
+                ],
+              ),
         leading: IconButton(
           tooltip: 'Minimize to vocabulary',
           onPressed: _minimizeToVocabulary,

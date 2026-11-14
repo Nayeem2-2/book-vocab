@@ -44,38 +44,52 @@ Future<List<ChapterData>> addImagePagesFromSource({
 
   final existingIds = book.pages.map((page) => page.stableId).toSet();
 
-  if (choice == 'camera') {
-    final result = await CunningDocumentScanner.scanDocuments();
-    final paths = result?.images ?? const <String>[];
-    for (final path in paths) {
-      await store.addScannedPage(book, await File(path).readAsBytes());
-    }
-  } else {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: [
-        'jpg',
-        'jpeg',
-        'png',
-        'webp',
-        'bmp',
-        'gif',
-        'tif',
-        'tiff',
-      ],
-      allowMultiple: true,
-      withData: true,
-    );
+  try {
+    if (choice == 'camera') {
+      final result = await CunningDocumentScanner.scanDocuments();
+      final paths = result?.images ?? const <String>[];
+      for (final path in paths) {
+        await store.addScannedPage(
+          book,
+          await File(path).readAsBytes(),
+          notify: false,
+        );
+      }
+    } else {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: [
+          'jpg',
+          'jpeg',
+          'png',
+          'webp',
+          'bmp',
+          'gif',
+          'tif',
+          'tiff',
+        ],
+        allowMultiple: true,
+        withData: true,
+      );
 
-    if (result != null) {
-      for (final picked in result.files) {
-        final bytes = picked.bytes ??
-            (picked.path == null ? null : await File(picked.path!).readAsBytes());
-        if (bytes != null) {
-          await store.addScannedPage(book, bytes);
+      if (result != null) {
+        for (final picked in result.files) {
+          final bytes = picked.bytes ??
+              (picked.path == null ? null : await File(picked.path!).readAsBytes());
+          if (bytes != null) {
+            await store.addScannedPage(book, bytes, notify: false);
+          }
         }
       }
     }
+  } finally {
+    // Notify once after the batch (also if a later file fails after earlier
+    // pages were successfully saved). The underlying metadata is persisted
+    // after every page, so partial successful imports remain recoverable.
+    final hasAddedPages = book.pages.any(
+      (page) => !existingIds.contains(page.stableId),
+    );
+    if (hasAddedPages) store.notifyImageBookPagesChanged(book);
   }
 
   return book.pages
