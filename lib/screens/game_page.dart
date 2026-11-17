@@ -79,6 +79,14 @@ class _GamePageState extends State<GamePage> with TickerProviderStateMixin {
 
   Future<void> _answer(bool known) async {
     if (_busy || _queue.isEmpty) return;
+    if (!widget.store.wordStatesReady.value) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Connect to load this account’s saved word progress before recording game results.'),
+        ),
+      );
+      return;
+    }
     _busy = true;
     _exitKnown = known;
     HapticFeedback.lightImpact();

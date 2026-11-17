@@ -345,18 +345,25 @@ class _ChapterPageState extends State<ChapterPage> {
   }
 
   Widget _wordCard(WordEntry entry) {
-    return ValueListenableBuilder<WordState>(
-      valueListenable: widget.store.wordStateListenable(entry.word),
-      builder: (context, state, _) {
-        if (state == WordState.known && !showKnown) {
-          return const SizedBox.shrink();
-        }
-        return _buildWordCard(entry, state);
-      },
+    return ValueListenableBuilder<bool>(
+      valueListenable: widget.store.wordStatesReady,
+      builder: (context, ready, _) => ValueListenableBuilder<WordState>(
+        valueListenable: widget.store.wordStateListenable(entry.word),
+        builder: (context, state, _) {
+          if (state == WordState.known && !showKnown) {
+            return const SizedBox.shrink();
+          }
+          return _buildWordCard(entry, state, wordStatesReady: ready);
+        },
+      ),
     );
   }
 
-  Widget _buildWordCard(WordEntry entry, WordState state) {
+  Widget _buildWordCard(
+    WordEntry entry,
+    WordState state, {
+    required bool wordStatesReady,
+  }) {
     final badgeColor = state == WordState.known
         ? const Color(0xFF27845B)
         : state == WordState.showAgain
@@ -370,9 +377,11 @@ class _ChapterPageState extends State<ChapterPage> {
 
     return Dismissible(
       key: ValueKey('${_currentChapter.stableId}:${entry.word}'),
-      direction: state == WordState.known
-          ? DismissDirection.startToEnd
-          : DismissDirection.endToStart,
+      direction: !wordStatesReady
+          ? DismissDirection.none
+          : state == WordState.known
+              ? DismissDirection.startToEnd
+              : DismissDirection.endToStart,
       background: Container(
         alignment: Alignment.centerLeft,
         padding: const EdgeInsets.only(left: 20),
@@ -478,8 +487,10 @@ class _ChapterPageState extends State<ChapterPage> {
                 ),
               ),
               IconButton(
-                tooltip: state == WordState.known ? 'Mark unknown' : 'Mark known',
-                onPressed: () {
+                tooltip: !wordStatesReady
+                    ? 'Connect to load this account’s progress'
+                    : state == WordState.known ? 'Mark unknown' : 'Mark known',
+                onPressed: !wordStatesReady ? null : () {
                   final next = state == WordState.known
                       ? WordState.unknown
                       : WordState.known;
@@ -512,8 +523,10 @@ class _ChapterPageState extends State<ChapterPage> {
                 ),
               ),
               IconButton(
-                tooltip: 'Mark as Show Again',
-                onPressed: () {
+                tooltip: wordStatesReady
+                    ? 'Mark as Show Again'
+                    : 'Connect to load this account’s progress',
+                onPressed: !wordStatesReady ? null : () {
                   widget.store.setWordState(entry.word, WordState.showAgain);
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
@@ -720,6 +733,25 @@ class _ChapterPageState extends State<ChapterPage> {
                     ),
                   ],
                 ),
+              ),
+              ValueListenableBuilder<bool>(
+                valueListenable: widget.store.wordStatesReady,
+                builder: (context, ready, _) {
+                  if (ready) return const SizedBox.shrink();
+                  return Container(
+                    width: double.infinity,
+                    margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFFF4D6),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Text(
+                      'Connect to the internet once to load this account’s saved word progress. Word-state changes are temporarily disabled; your books remain available offline.',
+                      style: TextStyle(fontSize: 12, color: Color(0xFF76520A)),
+                    ),
+                  );
+                },
               ),
               Expanded(
                 child: Builder(
@@ -934,6 +966,17 @@ class _MarkAllWordsSliderState extends State<_MarkAllWordsSlider> {
 
   Future<void> _finish(double value) async {
     if (_busy || value < 0.995) return;
+    if (!widget.store.wordStatesReady.value) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Connect to load this account’s word progress first.'),
+          ),
+        );
+      }
+      setState(() => _value = 0);
+      return;
+    }
     setState(() => _busy = true);
     try {
       await widget.store.markAllChapterKnown(widget.chapter);

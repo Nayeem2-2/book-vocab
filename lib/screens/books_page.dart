@@ -552,6 +552,25 @@ class _BooksPageState extends State<BooksPage> {
           body: Column(
             children: [
               _searchField(),
+              ValueListenableBuilder<bool>(
+                valueListenable: widget.store.wordStatesReady,
+                builder: (context, ready, _) {
+                  if (ready) return const SizedBox.shrink();
+                  return Container(
+                    width: double.infinity,
+                    margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFFF4D6),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Text(
+                      'Your books are available offline. Connect once to load this account’s saved word progress before changing word states.',
+                      style: TextStyle(fontSize: 12, color: Color(0xFF76520A)),
+                    ),
+                  );
+                },
+              ),
               Expanded(
                 child: filteredBooks.isEmpty
                     ? _emptyState(

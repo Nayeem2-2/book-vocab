@@ -39,6 +39,13 @@ class BookStore extends ChangeNotifier {
   static const int _maxPracticeScopeCaches = 8;
 
   Future<void> _saveChain = Future.value();
+  int _serverTimeOffsetMs = 0;
+
+  /// Supplies Firebase's estimated server/device clock offset for word-state
+  /// timestamps. Until sync obtains an offset, the device clock is used.
+  void setServerTimeOffsetMs(int offset) {
+    _serverTimeOffsetMs = offset;
+  }
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
@@ -208,6 +215,56 @@ class BookStore extends ChangeNotifier {
     await file.writeAsString(_encode(), flush: true);
   }
 
+  /// Compact complete snapshot used by account-specific cloud synchronization.
+  Map<String, List<String>> wordStateSnapshot() {
+    final known = _known.toList()..sort();
+    final again = _showAgain.toList()..sort();
+    return {'known': known, 'showAgain': again};
+  }
+
+  /// Creates a safety copy before a cloud snapshot replaces local word states.
+  Future<void> backupKnownWords() async {
+    final file = await _knownFile();
+    if (!await file.exists()) return;
+    final backup = File('${file.path}.backup-${DateTime.now().millisecondsSinceEpoch}');
+    await file.copy(backup.path);
+  }
+
+  /// Replaces the global word states with a validated cloud snapshot.
+  /// Unknown remains implicit: a word absent from both lists is Unknown.
+  Future<void> replaceWordStates({
+    required List<String> known,
+    required List<String> showAgain,
+  }) async {
+    final nextKnown = <String>{};
+    final nextAgain = <String>{};
+    for (final item in known) {
+      final key = normalizeWord(item);
+      if (key.isNotEmpty) nextKnown.add(key);
+    }
+    for (final item in showAgain) {
+      final key = normalizeWord(item);
+      if (key.isNotEmpty && !nextKnown.contains(key)) nextAgain.add(key);
+    }
+    final allWords = <String>{..._known, ..._showAgain, ...nextKnown, ...nextAgain};
+    _known
+      ..clear()
+      ..addAll(nextKnown);
+    _showAgain
+      ..clear()
+      ..addAll(nextAgain);
+    for (final key in allWords) {
+      final signal = _wordStateSignals[key];
+      if (signal != null) signal.value = getWordState(key);
+    }
+    _uniqueCache.clear();
+    _knownCountCache.clear();
+    _showAgainCountCache.clear();
+    _clearPracticeScopeCaches();
+    wordStateRevision.value++;
+    await _saveKnownWords();
+  }
+
   Future<void> _saveKnownWords() {
     _saveChain = _saveChain.then((_) => _writeNow()).catchError((_) {});
     return _saveChain;
@@ -230,6 +287,13 @@ class BookStore extends ChangeNotifier {
     return path;
   }
 
+  Future<void> _recordLocalWordStateModification() async {
+    await _prefs.setInt(
+      'word_states_last_modified_at',
+      DateTime.now().millisecondsSinceEpoch + _serverTimeOffsetMs,
+    );
+  }
+
   /// Picks a known_words.json and merges it. Returns newly known count, or null if cancelled.
   Future<int?> importKnownWords() async {
     final result = await FilePicker.platform.pickFiles(
@@ -245,6 +309,7 @@ class BookStore extends ChangeNotifier {
     final decoded = jsonDecode(utf8.decode(bytes));
     final added = _mergeJson(decoded);
     _refreshCachedWordCounts();
+    await _recordLocalWordStateModification();
     wordStateRevision.value++;
     await _saveKnownWords();
     return added;
@@ -656,6 +721,7 @@ class BookStore extends ChangeNotifier {
     final key = normalizeWord(word);
     if (key.isEmpty) return;
     if (!_applyWordState(key, newState)) return;
+    await _recordLocalWordStateModification();
     wordStateRevision.value++;
     await _saveKnownWords();
   }
@@ -674,6 +740,7 @@ class BookStore extends ChangeNotifier {
       }
     }
     if (changed) {
+      await _recordLocalWordStateModification();
       wordStateRevision.value++;
       await _saveKnownWords();
     }

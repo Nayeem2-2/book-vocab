@@ -20,9 +20,23 @@ class BookStore extends ChangeNotifier {
   final DictionaryService dictionary = DictionaryService();
   final OcrService _ocr = OcrService();
 
-  /// Global word states (shared by all books). Stored in known_words.json.
+  /// Word states are global across books, but isolated per Firebase account.
+  /// The active account's snapshot is stored in Accounts/word_states_<uid>.json.
   final Set<String> _known = {};
   final Set<String> _showAgain = {};
+  String? _activeAccountUid;
+  bool _accountWordStatesLoaded = false;
+  bool _hasLocalAccountCache = false;
+
+  /// A new account with no local cache must not edit words until its first
+  /// successful cloud read/write establishes which snapshot belongs to it.
+  final ValueNotifier<bool> wordStatesReady = ValueNotifier<bool>(false);
+
+  String? get activeAccountUid => _activeAccountUid;
+  bool get hasLocalAccountCache => _hasLocalAccountCache;
+
+  static String accountStorageKey(String uid) =>
+      base64Url.encode(utf8.encode(uid)).replaceAll('=', '');
 
   final Map<String, Set<String>> _uniqueCache = {};
   final Map<String, int> _knownCountCache = {};
@@ -39,6 +53,7 @@ class BookStore extends ChangeNotifier {
   static const int _maxPracticeScopeCaches = 8;
 
   Future<void> _saveChain = Future.value();
+  Future<void> _localMetadataChain = Future.value();
   int _serverTimeOffsetMs = 0;
 
   /// Supplies Firebase's estimated server/device clock offset for word-state
@@ -49,7 +64,9 @@ class BookStore extends ChangeNotifier {
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
-    await _loadKnownWords();
+    // Preserve the old device-global file for recovery, but never assign it
+    // automatically to whichever Google account happens to sign in first.
+    await _backupLegacyGlobalWordStates();
     // Load the dictionary directly from the bundled application asset.
     // Loading happens asynchronously; JSON parsing runs in a background
     // isolate so it does not block scrolling or other UI work.
@@ -117,88 +134,332 @@ class BookStore extends ChangeNotifier {
     }
   }
 
-  // ── Known words file ──
+  // ── Account-specific word-state files ──
 
-  Future<File> _knownFile() async {
+  Future<Directory> _accountStatesDirectory() async {
+    final root = await getApplicationDocumentsDirectory();
+    final directory = Directory('${root.path}/Accounts');
+    if (!await directory.exists()) {
+      await directory.create(recursive: true);
+    }
+    return directory;
+  }
+
+  Future<File> _legacyGlobalKnownFile() async {
     final root = await getApplicationDocumentsDirectory();
     return File('${root.path}/known_words.json');
   }
 
-  Future<void> _loadKnownWords() async {
-    final file = await _knownFile();
-    if (await file.exists()) {
-      try {
-        _mergeJson(jsonDecode(await file.readAsString()));
+  Future<File> _accountKnownFile(String uid) async {
+    final directory = await _accountStatesDirectory();
+    final token = accountStorageKey(uid);
+    return File('${directory.path}/word_states_$token.json');
+  }
+
+  Future<File> _accountSyncedFile(String uid) async {
+    final directory = await _accountStatesDirectory();
+    final token = accountStorageKey(uid);
+    return File('${directory.path}/word_states_synced_$token.json');
+  }
+
+  Future<File> _knownFile() async {
+    final uid = _activeAccountUid;
+    if (uid == null) {
+      throw StateError('No Google account is active for word-state storage.');
+    }
+    return _accountKnownFile(uid);
+  }
+
+  Future<void> _backupLegacyGlobalWordStates() async {
+    try {
+      final legacy = await _legacyGlobalKnownFile();
+      final backup = File('${legacy.path}.legacy-unassigned-backup');
+      if (await backup.exists()) return;
+
+      // Prefer the complete global file used by the preceding release.
+      if (await legacy.exists()) {
+        await legacy.copy(backup.path);
         return;
-      } catch (_) {
+      }
+
+      // Very old installations may still have per-book states_$id entries in
+      // SharedPreferences and no global file. Preserve those in the same
+      // unassigned backup format, but never load them into an account.
+      final legacyKnown = <String>{};
+      final legacyAgain = <String>{};
+      final records = _prefs.getStringList('book_records') ?? const [];
+      for (final record in records) {
+        try {
+          final map = jsonDecode(record) as Map<String, dynamic>;
+          final id = map['id'] as String;
+          final states = _prefs.getStringList('states_$id') ?? const [];
+          for (final entry in states) {
+            final separator = entry.lastIndexOf(':');
+            if (separator <= 0) continue;
+            final word = normalizeWord(entry.substring(0, separator));
+            final state = entry.substring(separator + 1);
+            if (word.isEmpty) continue;
+            if (state == 'known') {
+              legacyKnown.add(word);
+              legacyAgain.remove(word);
+            } else if (state == 'showAgain' && !legacyKnown.contains(word)) {
+              legacyAgain.add(word);
+            }
+          }
+        } catch (_) {
+          // Ignore one malformed legacy book record; preserve the others.
+        }
+      }
+
+      if (legacyKnown.isEmpty && legacyAgain.isEmpty) return;
+      final known = legacyKnown.toList()..sort();
+      final again = legacyAgain.toList()..sort();
+      await backup.writeAsString(
+        const JsonEncoder.withIndent('  ').convert({
+          'version': 1,
+          'known': known,
+          'showAgain': again,
+          'note': 'Unassigned legacy device data; not associated with a Firebase UID.',
+        }),
+        flush: true,
+      );
+    } catch (error) {
+      // Backup failure must not prevent access to books or authentication.
+      debugPrint('Could not preserve legacy global word states: $error');
+    }
+  }
+
+  /// Activates exactly one account's local cache. The previous account's
+  /// in-memory data is cleared before the new account's file is read.
+  /// Returns true when a valid account-specific cache existed.
+  Future<bool> activateAccount(String uid) async {
+    if (_activeAccountUid == uid && _accountWordStatesLoaded) {
+      return _hasLocalAccountCache;
+    }
+
+    // Complete queued writes for the previous UID before switching paths.
+    await flushPendingWordStateWrites();
+    _activeAccountUid = uid;
+    // Reuse the last known Firebase clock offset while offline so local
+    // changes still receive timestamps in the same time domain as cloud data.
+    _serverTimeOffsetMs = _prefs.getInt('word_states_server_time_offset_ms') ?? 0;
+    _accountWordStatesLoaded = false;
+    _hasLocalAccountCache = false;
+    wordStatesReady.value = false;
+
+    _known.clear();
+    _showAgain.clear();
+    _invalidateAllWordCaches();
+    _refreshWordSignals();
+    wordStateRevision.value++;
+
+    final file = await _accountKnownFile(uid);
+    var sourceFile = file;
+    var restoredFromSyncedBaseline = false;
+    if (!await sourceFile.exists()) {
+      // The known-good snapshot is also a recoverable local cache. This covers
+      // a crash between saving the baseline and the ordinary account file.
+      final baseline = await _accountSyncedFile(uid);
+      if (await baseline.exists()) {
+        sourceFile = baseline;
+        restoredFromSyncedBaseline = true;
+      }
+    }
+    if (await sourceFile.exists()) {
+      try {
+        final decoded = jsonDecode(await sourceFile.readAsString());
+        _mergeAccountWordStateJson(decoded);
+        _hasLocalAccountCache = true;
+        // Keep word-state controls gated until Firebase confirms this UID's
+        // cloud snapshot, or reports that it is offline and this local cache
+        // must be used. This prevents editing stale cached data before login
+        // reconciliation completes.
+        wordStatesReady.value = false;
+        _refreshWordSignals();
+        if (restoredFromSyncedBaseline) {
+          await file.writeAsString(_encode(), flush: true);
+        }
+      } catch (error) {
+        // Preserve malformed account data for recovery. If the main cache is
+        // corrupt, attempt this same UID's last-known-good snapshot; never
+        // fall back to the device-global legacy file or another UID.
+        final corrupt = File(
+          '${sourceFile.path}.corrupt-${DateTime.now().millisecondsSinceEpoch}',
+        );
+        await sourceFile.copy(corrupt.path);
         _known.clear();
         _showAgain.clear();
-      }
-    }
-    await _migrateFromPrefs();
-  }
-
-  /// One-time migration of the old per-book states into the global file.
-  Future<void> _migrateFromPrefs() async {
-    final saved = _prefs.getStringList('book_records') ?? [];
-    for (final record in saved) {
-      try {
-        final map = jsonDecode(record) as Map<String, dynamic>;
-        final id = map['id'] as String;
-        final states = _prefs.getStringList('states_$id') ?? [];
-        for (final entry in states) {
-          final idx = entry.lastIndexOf(':');
-          if (idx <= 0) continue;
-          final w = normalizeWord(entry.substring(0, idx));
-          final s = entry.substring(idx + 1);
-          if (w.isEmpty) continue;
-          if (s == 'known') {
-            _known.add(w);
-          } else if (s == 'showAgain') {
-            _showAgain.add(w);
+        if (!restoredFromSyncedBaseline) {
+          final baseline = await _accountSyncedFile(uid);
+          if (await baseline.exists()) {
+            try {
+              _mergeAccountWordStateJson(
+                jsonDecode(await baseline.readAsString()),
+              );
+              _hasLocalAccountCache = true;
+              wordStatesReady.value = false;
+              _refreshWordSignals();
+              await file.writeAsString(_encode(), flush: true);
+            } catch (_) {
+              final badBaseline = File(
+                '${baseline.path}.corrupt-${DateTime.now().millisecondsSinceEpoch}',
+              );
+              await baseline.copy(badBaseline.path);
+              _known.clear();
+              _showAgain.clear();
+            }
           }
         }
-      } catch (_) {}
-    }
-    _showAgain.removeAll(_known);
-    await _writeNow();
-  }
-
-  /// Merges a decoded known_words.json into memory. Known wins over showAgain.
-  /// Returns how many words became newly known.
-  int _mergeJson(dynamic decoded) {
-    List<dynamic> knownList = const [];
-    List<dynamic> againList = const [];
-
-    if (decoded is List) {
-      knownList = decoded;
-    } else if (decoded is Map) {
-      final k = decoded['known'];
-      final a = decoded['showAgain'] ?? decoded['show_again'];
-      if (k is! List && a is! List) {
-        throw const FormatException(
-            'This file has no "known" or "showAgain" list.');
       }
-      if (k is List) knownList = k;
-      if (a is List) againList = a;
-    } else {
-      throw const FormatException('Unrecognised known words file.');
     }
-
-    final before = _known.length;
-    for (final item in knownList) {
-      final w = normalizeWord(item.toString());
-      if (w.isEmpty) continue;
-      _known.add(w);
-      _showAgain.remove(w);
-    }
-    for (final item in againList) {
-      final w = normalizeWord(item.toString());
-      if (w.isEmpty || _known.contains(w)) continue;
-      _showAgain.add(w);
-    }
-    return _known.length - before;
+    _accountWordStatesLoaded = true;
+    return _hasLocalAccountCache;
   }
+
+  /// Clears active memory at logout without deleting this account's cache.
+  Future<void> clearActiveAccountWordStates() async {
+    await flushPendingWordStateWrites();
+    _activeAccountUid = null;
+    _accountWordStatesLoaded = false;
+    _hasLocalAccountCache = false;
+    wordStatesReady.value = false;
+    _known.clear();
+    _showAgain.clear();
+    _invalidateAllWordCaches();
+    _refreshWordSignals();
+    wordStateRevision.value++;
+  }
+
+  void markWordStatesReady() {
+    wordStatesReady.value = true;
+  }
+
+  /// Allows cached word-state use when Firebase explicitly reports offline.
+  /// A new UID with no account cache remains locked until its first cloud
+  /// snapshot has been fetched or safely initialized.
+  void markCachedWordStatesReadyOffline() {
+    if (_hasLocalAccountCache && _accountWordStatesLoaded) {
+      wordStatesReady.value = true;
+    }
+  }
+
+  void _refreshWordSignals() {
+    for (final signal in _wordStateSignals.entries) {
+      final refreshed = getWordState(signal.key);
+      if (signal.value.value != refreshed) signal.value.value = refreshed;
+    }
+  }
+
+  void _invalidateAllWordCaches() {
+    final ids = <String>{
+      ..._bookWordCacheFutures.keys,
+      ..._uniqueCache.keys,
+      ...books.map((book) => book.id),
+    };
+    for (final id in ids) {
+      _invalidateBookWordCache(id);
+    }
+    _bookWordCacheFutures.clear();
+    _clearPracticeScopeCaches();
+  }
+
+  /// Captures the exact uploaded/downloaded snapshot as the last known-good
+  /// version for this UID. It is used if the user explicitly discards pending
+  /// changes during logout.
+  Future<void> markWordStateSnapshotAsSynced({
+    required String uid,
+    required List<String> known,
+    required List<String> showAgain,
+    required int updatedAt,
+  }) async {
+    final file = await _accountSyncedFile(uid);
+    final payload = <String, dynamic>{
+      'version': 1,
+      'known': List<String>.from(known)..sort(),
+      'showAgain': List<String>.from(showAgain)..sort(),
+      'updatedAt': updatedAt,
+    };
+    await file.writeAsString(
+      const JsonEncoder.withIndent('  ').convert(payload),
+      flush: true,
+    );
+    if (_activeAccountUid == uid) {
+      _hasLocalAccountCache = true;
+      _accountWordStatesLoaded = true;
+      wordStatesReady.value = true;
+    }
+  }
+
+  /// True when current local states differ from the last successfully synced
+  /// snapshot. Without a baseline, any non-empty local state is pending.
+  Future<bool> hasUnsyncedWordStateChanges() async {
+    final uid = _activeAccountUid;
+    if (uid == null) return false;
+    final baselineFile = await _accountSyncedFile(uid);
+    if (!await baselineFile.exists()) {
+      return _known.isNotEmpty || _showAgain.isNotEmpty;
+    }
+    try {
+      final decoded = jsonDecode(await baselineFile.readAsString());
+      if (decoded is! Map ||
+          decoded['known'] is! List ||
+          decoded['showAgain'] is! List) {
+        throw const FormatException('Last-synced snapshot is incomplete.');
+      }
+      final known = (decoded['known'] as List)
+          .map((item) => normalizeWord(item.toString()))
+          .where((item) => item.isNotEmpty)
+          .toSet();
+      final again = (decoded['showAgain'] as List)
+          .map((item) => normalizeWord(item.toString()))
+          .where((item) => item.isNotEmpty && !known.contains(item))
+          .toSet();
+      return !_sameStringSet(_known, known) ||
+          !_sameStringSet(_showAgain, again);
+    } catch (_) {
+      // An unreadable baseline is not permission to discard current data.
+      return true;
+    }
+  }
+
+  /// Restores the last successful snapshot. If this account has never
+  /// synchronized, its safe baseline is an empty (all Unknown) state.
+  Future<void> restoreLastSyncedWordStates() async {
+    await _localMetadataChain;
+    final uid = _activeAccountUid;
+    if (uid == null) return;
+    final baselineFile = await _accountSyncedFile(uid);
+    List<String> known = const [];
+    List<String> again = const [];
+    var updatedAt = 0;
+    if (await baselineFile.exists()) {
+      final decoded = jsonDecode(await baselineFile.readAsString());
+      if (decoded is! Map ||
+          decoded['known'] is! List ||
+          decoded['showAgain'] is! List) {
+        throw const FormatException('Last-synced snapshot is incomplete.');
+      }
+      known = (decoded['known'] as List)
+          .map((item) => item.toString()).toList();
+      again = (decoded['showAgain'] as List)
+          .map((item) => item.toString()).toList();
+      updatedAt = (decoded['updatedAt'] as num?)?.toInt() ?? 0;
+    }
+    await replaceWordStates(known: known, showAgain: again);
+    final prefs = await SharedPreferences.getInstance();
+    final token = accountStorageKey(uid);
+    final timestampKey = 'word_states_last_modified_at_$token';
+    if (updatedAt > 0) {
+      await prefs.setInt(timestampKey, updatedAt);
+    } else {
+      await prefs.remove(timestampKey);
+    }
+    await prefs.setBool('word_states_timestamp_server_adjusted_$token', true);
+    wordStatesReady.value = true;
+  }
+
+  bool _sameStringSet(Set<String> left, Set<String> right) =>
+      left.length == right.length && left.containsAll(right);
 
   String _encode() {
     final known = _known.toList()..sort();
@@ -210,9 +471,136 @@ class BookStore extends ChangeNotifier {
     });
   }
 
-  Future<void> _writeNow() async {
-    final file = await _knownFile();
-    await file.writeAsString(_encode(), flush: true);
+
+  /// Account caches and synced baselines are complete snapshots. Missing
+  /// either list is corruption, not an empty list, because that could erase
+  /// Show Again / Known states during account recovery.
+  int _mergeAccountWordStateJson(dynamic decoded) {
+    if (decoded is! Map ||
+        decoded['known'] is! List ||
+        decoded['showAgain'] is! List) {
+      throw const FormatException(
+        'Account word-state cache is incomplete or invalid.',
+      );
+    }
+    return _mergeJson(decoded);
+  }
+
+  /// Merges imported JSON. Known wins over Show Again. User-imported older
+  /// files may contain only a known list, so this parser remains permissive.
+  int _mergeJson(dynamic decoded) {
+    List<dynamic> knownList = const [];
+    List<dynamic> againList = const [];
+    if (decoded is List) {
+      knownList = decoded;
+    } else if (decoded is Map) {
+      final knownRaw = decoded['known'];
+      final againRaw = decoded['showAgain'] ?? decoded['show_again'];
+      if (knownRaw is! List && againRaw is! List) {
+        throw const FormatException(
+          'This file has no "known" or "showAgain" list.',
+        );
+      }
+      if (knownRaw is List) knownList = knownRaw;
+      if (againRaw is List) againList = againRaw;
+    } else {
+      throw const FormatException('Unrecognised known words file.');
+    }
+
+    final before = _known.length;
+    for (final item in knownList) {
+      final word = normalizeWord(item.toString());
+      if (word.isEmpty) continue;
+      _known.add(word);
+      _showAgain.remove(word);
+    }
+    for (final item in againList) {
+      final word = normalizeWord(item.toString());
+      if (word.isEmpty || _known.contains(word)) continue;
+      _showAgain.add(word);
+    }
+    return _known.length - before;
+  }
+
+  Future<void> _saveKnownWords() {
+    final uid = _activeAccountUid;
+    if (uid == null) return Future<void>.value();
+    // Capture both UID and payload now: a queued write must never land in a
+    // different account's file after an account switch.
+    final fileFuture = _accountKnownFile(uid);
+    final payload = _encode();
+    _saveChain = _saveChain.then((_) async {
+      final file = await fileFuture;
+      await file.writeAsString(payload, flush: true);
+      if (_activeAccountUid == uid) _hasLocalAccountCache = true;
+    }).catchError((Object error) {
+      debugPrint('Could not persist account word states: $error');
+    });
+    return _saveChain;
+  }
+
+  Future<void> _recordLocalWordStateModification() {
+    final uid = _activeAccountUid;
+    if (uid == null) return Future<void>.value();
+    final token = accountStorageKey(uid);
+    final timestamp =
+        DateTime.now().millisecondsSinceEpoch + _serverTimeOffsetMs;
+    final key = 'word_states_last_modified_at_$token';
+    _localMetadataChain = _localMetadataChain.then((_) async {
+      await _prefs.setInt(key, timestamp);
+    });
+    return _localMetadataChain;
+  }
+
+  /// Waits for any word-state timestamp and file writes already scheduled by
+  /// the UI. Manual sync/logout may be tapped immediately after a state change.
+  Future<void> flushPendingWordStateWrites() async {
+    while (true) {
+      final metadataPending = _localMetadataChain;
+      final filesPending = _saveChain;
+      await metadataPending;
+      await filesPending;
+      // A new edit may have queued another timestamp/file write while the
+      // previous futures were completing. Continue until the queue is stable.
+      if (identical(metadataPending, _localMetadataChain) &&
+          identical(filesPending, _saveChain)) {
+        return;
+      }
+    }
+  }
+
+  /// Replaces the global word-state collections with a normalized snapshot.
+  /// If nothing changed, caches and revisions are deliberately left untouched.
+  Future<void> replaceWordStates({
+    required List<String> known,
+    required List<String> showAgain,
+  }) async {
+    final nextKnown = <String>{};
+    final nextAgain = <String>{};
+    for (final item in known) {
+      final key = normalizeWord(item);
+      if (key.isNotEmpty) nextKnown.add(key);
+    }
+    for (final item in showAgain) {
+      final key = normalizeWord(item);
+      if (key.isNotEmpty && !nextKnown.contains(key)) nextAgain.add(key);
+    }
+
+    if (_sameStringSet(_known, nextKnown) &&
+        _sameStringSet(_showAgain, nextAgain)) {
+      return;
+    }
+
+    _known
+      ..clear()
+      ..addAll(nextKnown);
+    _showAgain
+      ..clear()
+      ..addAll(nextAgain);
+    _refreshWordSignals();
+    _invalidateAllWordCaches();
+    wordStateRevision.value++;
+    await _saveKnownWords();
   }
 
   /// Compact complete snapshot used by account-specific cloud synchronization.
@@ -230,48 +618,11 @@ class BookStore extends ChangeNotifier {
     await file.copy(backup.path);
   }
 
-  /// Replaces the global word states with a validated cloud snapshot.
-  /// Unknown remains implicit: a word absent from both lists is Unknown.
-  Future<void> replaceWordStates({
-    required List<String> known,
-    required List<String> showAgain,
-  }) async {
-    final nextKnown = <String>{};
-    final nextAgain = <String>{};
-    for (final item in known) {
-      final key = normalizeWord(item);
-      if (key.isNotEmpty) nextKnown.add(key);
-    }
-    for (final item in showAgain) {
-      final key = normalizeWord(item);
-      if (key.isNotEmpty && !nextKnown.contains(key)) nextAgain.add(key);
-    }
-    final allWords = <String>{..._known, ..._showAgain, ...nextKnown, ...nextAgain};
-    _known
-      ..clear()
-      ..addAll(nextKnown);
-    _showAgain
-      ..clear()
-      ..addAll(nextAgain);
-    for (final key in allWords) {
-      final signal = _wordStateSignals[key];
-      if (signal != null) signal.value = getWordState(key);
-    }
-    _uniqueCache.clear();
-    _knownCountCache.clear();
-    _showAgainCountCache.clear();
-    _clearPracticeScopeCaches();
-    wordStateRevision.value++;
-    await _saveKnownWords();
-  }
-
-  Future<void> _saveKnownWords() {
-    _saveChain = _saveChain.then((_) => _writeNow()).catchError((_) {});
-    return _saveChain;
-  }
-
   /// Lets the user save known_words.json anywhere. Returns the path or null.
   Future<String?> exportKnownWords() async {
+    if (!wordStatesReady.value || _activeAccountUid == null) {
+      throw StateError('Connect to load this account’s vocabulary before exporting word states.');
+    }
     final bytes = Uint8List.fromList(utf8.encode(_encode()));
     final path = await FilePicker.platform.saveFile(
       dialogTitle: 'Export known words',
@@ -287,15 +638,11 @@ class BookStore extends ChangeNotifier {
     return path;
   }
 
-  Future<void> _recordLocalWordStateModification() async {
-    await _prefs.setInt(
-      'word_states_last_modified_at',
-      DateTime.now().millisecondsSinceEpoch + _serverTimeOffsetMs,
-    );
-  }
-
   /// Picks a known_words.json and merges it. Returns newly known count, or null if cancelled.
   Future<int?> importKnownWords() async {
+    if (!wordStatesReady.value || _activeAccountUid == null) {
+      throw StateError('Connect to the internet once to load this account’s vocabulary before importing word states.');
+    }
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['json'],
@@ -307,11 +654,17 @@ class BookStore extends ChangeNotifier {
       throw Exception('Could not read the selected file.');
     }
     final decoded = jsonDecode(utf8.decode(bytes));
+    final before = wordStateSnapshot();
     final added = _mergeJson(decoded);
-    _refreshCachedWordCounts();
-    await _recordLocalWordStateModification();
-    wordStateRevision.value++;
-    await _saveKnownWords();
+    final after = wordStateSnapshot();
+    final changed = !_sameStringSet(before['known']!.toSet(), after['known']!.toSet()) ||
+        !_sameStringSet(before['showAgain']!.toSet(), after['showAgain']!.toSet());
+    if (changed) {
+      _refreshCachedWordCounts();
+      wordStateRevision.value++;
+      await _recordLocalWordStateModification();
+      await _saveKnownWords();
+    }
     return added;
   }
 
@@ -718,15 +1071,19 @@ class BookStore extends ChangeNotifier {
   }
 
   Future<void> setWordState(String word, WordState newState) async {
+    if (!wordStatesReady.value || _activeAccountUid == null) return;
     final key = normalizeWord(word);
     if (key.isEmpty) return;
     if (!_applyWordState(key, newState)) return;
-    await _recordLocalWordStateModification();
+    // Notify the sync debounce immediately; the service flushes the timestamp
+    // before reading it, so manual sync cannot outrun this async write.
     wordStateRevision.value++;
+    await _recordLocalWordStateModification();
     await _saveKnownWords();
   }
 
   Future<void> markAllChapterKnown(ChapterData chapter) async {
+    if (!wordStatesReady.value || _activeAccountUid == null) return;
     var changed = false;
     var processed = 0;
     for (final entry in chapter.words) {
@@ -740,8 +1097,8 @@ class BookStore extends ChangeNotifier {
       }
     }
     if (changed) {
-      await _recordLocalWordStateModification();
       wordStateRevision.value++;
+      await _recordLocalWordStateModification();
       await _saveKnownWords();
     }
   }
@@ -1020,7 +1377,7 @@ class BookStore extends ChangeNotifier {
         final file = File(book.jsonPath);
         if (await file.exists()) await file.delete();
       }
-      // Known words are intentionally global and are not deleted with a book.
+      // Account-specific word states are intentionally retained when a book is deleted.
       await _prefs.remove('states_${book.id}');
     }
 
@@ -1041,6 +1398,7 @@ class BookStore extends ChangeNotifier {
   }
   @override
   void dispose() {
+    wordStatesReady.dispose();
     wordStateRevision.dispose();
     for (final signal in _wordStateSignals.values.toList()) {
       signal.dispose();
