@@ -12,8 +12,9 @@ import 'parts_page.dart';
 import 'pages_page.dart';
 
 class BooksPage extends StatefulWidget {
-  const BooksPage({super.key, required this.store});
+  const BooksPage({super.key, required this.store, this.trailingAction});
   final BookStore store;
+  final Widget? trailingAction;
 
   @override
   State<BooksPage> createState() => _BooksPageState();
@@ -538,6 +539,7 @@ class _BooksPageState extends State<BooksPage> {
                       ],
                     ),
                     const SizedBox(width: 4),
+                    if (widget.trailingAction != null) widget.trailingAction!,
                   ],
           ),
           floatingActionButton: _selectionMode || widget.store.books.isEmpty
