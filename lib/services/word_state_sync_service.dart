@@ -1,22 +1,29 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'book_store.dart';
 
-enum WordSyncStatus { synced, pending, syncing, failed }
+enum WordSyncStatus { synced, pending, syncing, failed, offline, reconnecting }
 
 /// Synchronizes one complete Known / Show Again snapshot for the active UID.
 /// Books, pages, images, OCR data and dictionary data are never uploaded.
 class WordStateSyncService {
-  WordStateSyncService({required this.store, FirebaseDatabase? database})
-      : _database = database ?? FirebaseDatabase.instance;
+  WordStateSyncService({
+    required this.store,
+    FirebaseDatabase? database,
+    Connectivity? connectivity,
+  })  : _database = database ?? FirebaseDatabase.instance,
+        _connectivity = connectivity ?? Connectivity();
 
   final BookStore store;
   final FirebaseDatabase _database;
+  final Connectivity _connectivity;
 
   final ValueNotifier<WordSyncStatus> status =
       ValueNotifier<WordSyncStatus>(WordSyncStatus.pending);
@@ -26,14 +33,27 @@ class WordStateSyncService {
   static const String _serverOffsetKey = 'word_states_server_time_offset_ms';
 
   StreamSubscription<DatabaseEvent>? _connectionSubscription;
+  StreamSubscription<List<ConnectivityResult>>? _networkSubscription;
+  AppLifecycleListener? _lifecycleListener;
   Timer? _debounce;
   Timer? _retryTimer;
+  Timer? _recoveryTimer;
+  Timer? _connectionListenerRestartTimer;
+  Timer? _networkListenerRestartTimer;
   String? _uid;
   Future<void>? _activeSync;
   bool _disposed = false;
   bool _listenerAttached = false;
   bool _applyingRemote = false;
   bool _firebaseConnected = false;
+  bool? _deviceNetworkAvailable;
+  bool _networkCheckInProgress = false;
+  bool _firebaseProbeInProgress = false;
+  bool _connectionListenerRestartInProgress = false;
+  bool _networkListenerRestartInProgress = false;
+  bool _recoveryCheckInProgress = false;
+  int _connectionListenerEpoch = 0;
+  DateTime? _lastReconnectKickAt;
   // A reconnect (or another explicit sync request) that occurs while a sync
   // is running must not be lost. The current operation is allowed to finish
   // or time out, then exactly one fresh attempt is started immediately.
@@ -50,71 +70,460 @@ class WordStateSyncService {
   String _timestampAdjustedKey(String uid) =>
       'word_states_timestamp_server_adjusted_${BookStore.accountStorageKey(uid)}';
 
-  /// Starts local-change and Firebase connectivity monitoring for one UID.
+  /// Starts local-change, device-network, app-lifecycle and Firebase connection
+  /// monitoring for one UID. Device network state is only an early warning;
+  /// Firebase's own connection signal remains authoritative for synchronization.
   void attachForUser(String uid) {
     if (_uid == uid && _listenerAttached) return;
 
     _accountGeneration++;
     _debounce?.cancel();
     _retryTimer?.cancel();
+    _recoveryTimer?.cancel();
+    _connectionListenerRestartTimer?.cancel();
+    _networkListenerRestartTimer?.cancel();
     unawaited(_connectionSubscription?.cancel());
+    unawaited(_networkSubscription?.cancel());
     _connectionSubscription = null;
+    _networkSubscription = null;
+    _lifecycleListener?.dispose();
+    _lifecycleListener = null;
     _detachListener();
     _activeSync = null;
     _syncRequestedAfterActive = false;
     _uid = uid;
     _firebaseConnected = false;
+    _deviceNetworkAvailable = null;
+    _networkCheckInProgress = false;
+    _firebaseProbeInProgress = false;
+    _connectionListenerRestartInProgress = false;
+    _networkListenerRestartInProgress = false;
+    _recoveryCheckInProgress = false;
     _retryAttempt = 0;
+    _lastReconnectKickAt = null;
     lastError.value = null;
     status.value = WordSyncStatus.pending;
 
     store.wordStateRevision.addListener(_onLocalRevision);
     _listenerAttached = true;
     final generation = _accountGeneration;
-    _connectionSubscription = _database.ref('.info/connected').onValue.listen(
+
+    _lifecycleListener = AppLifecycleListener(
+      onResume: () => unawaited(_handleAppResumed(uid, generation)),
+    );
+    _attachFirebaseConnectionListener(uid, generation);
+    _attachNetworkListener(uid, generation);
+    _ensureRecoveryTimer(uid, generation);
+    unawaited(_refreshDeviceNetwork(uid, generation));
+  }
+
+  void _attachFirebaseConnectionListener(String uid, int generation) {
+    if (!_isCurrent(uid, generation) || _connectionSubscription != null) {
+      return;
+    }
+
+    final epoch = ++_connectionListenerEpoch;
+    late final StreamSubscription<DatabaseEvent> subscription;
+    subscription = _database.ref('.info/connected').onValue.listen(
       (event) {
-        if (!_isCurrent(uid, generation)) return;
-        final connected = event.snapshot.value == true;
-        final wasConnected = _firebaseConnected;
-        _firebaseConnected = connected;
-        if (connected) {
-          // A confirmed Firebase reconnection always bypasses backoff. If an
-          // older operation is still awaiting a request/timeout, remember the
-          // request and start one fresh sync as soon as that operation settles.
-          _retryTimer?.cancel();
-          _retryAttempt = 0;
-          if (!wasConnected) {
-            _debounce?.cancel();
-            if (_activeSync != null) {
-              _syncRequestedAfterActive = true;
-              status.value = WordSyncStatus.pending;
-              lastError.value =
-                  'Connection restored — an immediate synchronization retry is queued.';
-            } else {
-              unawaited(syncNow());
-            }
-          }
-        } else {
-          // A returning account may continue with its own previously synced
-          // cache while offline. A brand-new account with no cache stays
-          // read-only until its first successful cloud reconciliation.
-          store.markCachedWordStatesReadyOffline();
-          _debounce?.cancel();
-          _retryTimer?.cancel();
-          // Show the offline state even if a request was in flight. That
-          // request cannot declare the account Synced while disconnected.
-          status.value = WordSyncStatus.pending;
-          lastError.value = store.hasLocalAccountCache
-              ? 'Offline — using this account’s saved progress.'
-              : 'Waiting for the first connection to load this account’s progress.';
+        if (!_isCurrent(uid, generation) ||
+            epoch != _connectionListenerEpoch) {
+          return;
         }
+        _handleFirebaseConnectionValue(
+          event.snapshot.value == true,
+          uid,
+          generation,
+        );
       },
       onError: (Object error) {
-        if (_isCurrent(uid, generation)) {
-          debugPrint('Firebase connection monitor error: $error');
+        if (!_isCurrent(uid, generation) ||
+            epoch != _connectionListenerEpoch) {
+          return;
         }
+        debugPrint('Firebase connection monitor error: $error');
+        _connectionSubscription = null;
+        _firebaseConnected = false;
+        _setConnectionWaitingStatus();
+        _ensureRecoveryTimer(uid, generation);
+        unawaited(subscription.cancel());
+        _scheduleFirebaseConnectionListenerRestart(uid, generation);
+      },
+      onDone: () {
+        if (!_isCurrent(uid, generation) ||
+            epoch != _connectionListenerEpoch) {
+          return;
+        }
+        debugPrint('Firebase connection monitor stream ended; restarting it.');
+        _connectionSubscription = null;
+        _firebaseConnected = false;
+        _setConnectionWaitingStatus();
+        _ensureRecoveryTimer(uid, generation);
+        _scheduleFirebaseConnectionListenerRestart(uid, generation);
       },
     );
+    _connectionSubscription = subscription;
+  }
+
+  void _handleFirebaseConnectionValue(
+    bool connected,
+    String uid,
+    int generation,
+  ) {
+    if (!_isCurrent(uid, generation)) return;
+    final wasConnected = _firebaseConnected;
+    _firebaseConnected = connected;
+
+    if (connected) {
+      // A successful Firebase connection is stronger evidence than the
+      // device-network plugin, whose events can briefly lag during Wi-Fi/mobile
+      // handoffs. From this point Firebase itself confirms reachability.
+      _deviceNetworkAvailable = true;
+      debugPrint('[FIREBASE] Realtime Database connected.');
+      _lastReconnectKickAt = null;
+      _recoveryTimer?.cancel();
+      _recoveryTimer = null;
+      _retryTimer?.cancel();
+      _retryAttempt = 0;
+      if (!wasConnected ||
+          status.value == WordSyncStatus.offline ||
+          status.value == WordSyncStatus.reconnecting) {
+        _debounce?.cancel();
+        if (_activeSync != null) {
+          _syncRequestedAfterActive = true;
+          status.value = WordSyncStatus.pending;
+          lastError.value =
+              'Firebase reconnected — an immediate synchronization check is queued.';
+        } else {
+          unawaited(syncNow());
+        }
+      } else if (status.value == WordSyncStatus.pending &&
+          _activeSync == null) {
+        unawaited(syncNow());
+      }
+      return;
+    }
+
+    // A returning account may continue with its own previously synced cache
+    // while offline. A new account without a cache remains read-only until its
+    // first successful cloud reconciliation.
+    debugPrint('[FIREBASE] Realtime Database disconnected.');
+    store.markCachedWordStatesReadyOffline();
+    _debounce?.cancel();
+    _retryTimer?.cancel();
+    _setConnectionWaitingStatus();
+    _ensureRecoveryTimer(uid, generation);
+  }
+
+  void _attachNetworkListener(String uid, int generation) {
+    if (!_isCurrent(uid, generation) || _networkSubscription != null) return;
+    try {
+      late final StreamSubscription<List<ConnectivityResult>> subscription;
+      subscription = _connectivity.onConnectivityChanged.listen(
+        (results) => _handleDeviceNetworkResults(results, uid, generation),
+        onError: (Object error) {
+          if (!_isCurrent(uid, generation)) return;
+          debugPrint('Device network monitor error: $error');
+          _networkSubscription = null;
+          unawaited(subscription.cancel());
+          _scheduleNetworkListenerRestart(uid, generation);
+        },
+        onDone: () {
+          if (!_isCurrent(uid, generation)) return;
+          debugPrint('Device network monitor stream ended; restarting it.');
+          _networkSubscription = null;
+          _scheduleNetworkListenerRestart(uid, generation);
+        },
+      );
+      _networkSubscription = subscription;
+    } catch (error) {
+      debugPrint('Could not attach device network monitor: $error');
+      _scheduleNetworkListenerRestart(uid, generation);
+    }
+  }
+
+  void _handleDeviceNetworkResults(
+    List<ConnectivityResult> results,
+    String uid,
+    int generation,
+  ) {
+    if (!_isCurrent(uid, generation)) return;
+    // Any reported network transport means an interface is available. This
+    // is only a reason to test Firebase, never proof that the Internet itself
+    // is reachable (for example, Wi-Fi may be connected without Internet).
+    // Include Bluetooth tethering and less common transports rather than
+    // incorrectly declaring them Offline.
+    final available = results.any(
+      (result) => result != ConnectivityResult.none,
+    );
+    final wasAvailable = _deviceNetworkAvailable;
+    _deviceNetworkAvailable = available;
+    if (wasAvailable != available) {
+      debugPrint(
+        '[NETWORK] ${available ? "Interface available" : "No network interface"}; results=$results',
+      );
+    }
+
+    if (!available) {
+      // Report the device-side outage immediately. Keep Firebase's last signal
+      // intact: its listener remains the source of truth about RTDB reachability.
+      // The 20-second recovery check and the next network event reconcile both.
+      _lastReconnectKickAt = null;
+      store.markCachedWordStatesReadyOffline();
+      _setConnectionWaitingStatus();
+      _debounce?.cancel();
+      _retryTimer?.cancel();
+      _ensureRecoveryTimer(uid, generation);
+      return;
+    }
+
+    if (wasAvailable != true || !_firebaseConnected) {
+      // Network returned (or Firebase is still disconnected despite an
+      // available interface): bypass backoff and actively revive the RTDB
+      // connection monitor. This is only a prompt; .info/connected remains
+      // the authority that allows a sync to start.
+      _requestFirebaseReconnect(uid, generation);
+    } else if (status.value == WordSyncStatus.pending &&
+        _activeSync == null) {
+      unawaited(syncNow());
+    }
+  }
+
+  Future<void> _refreshDeviceNetwork(String uid, int generation) async {
+    if (!_isCurrent(uid, generation) || _networkCheckInProgress) return;
+    _networkCheckInProgress = true;
+    try {
+      final results = await _connectivity
+          .checkConnectivity()
+          .timeout(const Duration(seconds: 5));
+      if (_isCurrent(uid, generation)) {
+        _handleDeviceNetworkResults(results, uid, generation);
+      }
+    } catch (error) {
+      // If this secondary plugin is unavailable, do not keep a stale
+      // `false` value that could block a healthy Firebase connection. Let
+      // Firebase remain authoritative until the next successful interface
+      // check. If Firebase is already connected, treat reachability as proven.
+      debugPrint('Device network check failed; relying on Firebase: $error');
+      if (_isCurrent(uid, generation)) {
+        _deviceNetworkAvailable = _firebaseConnected ? true : null;
+        if (!_firebaseConnected) {
+          _setConnectionWaitingStatus();
+          _ensureRecoveryTimer(uid, generation);
+        }
+      }
+    } finally {
+      _networkCheckInProgress = false;
+    }
+  }
+
+  Future<void> _handleAppResumed(String uid, int generation) async {
+    if (!_isCurrent(uid, generation)) return;
+    // Android may not deliver network-change events while the app is in the
+    // background. Re-query the active interface as soon as the app resumes.
+    await _refreshDeviceNetwork(uid, generation);
+    if (!_isCurrent(uid, generation)) return;
+    if (_deviceNetworkAvailable == true && !_firebaseConnected) {
+      _requestFirebaseReconnect(uid, generation);
+    } else if (_firebaseConnected &&
+        status.value == WordSyncStatus.pending &&
+        _activeSync == null) {
+      unawaited(syncNow());
+    }
+  }
+
+  void _requestFirebaseReconnect(String uid, int generation) {
+    if (!_isCurrent(uid, generation)) return;
+    _retryTimer?.cancel();
+    _retryAttempt = 0;
+
+    if (_firebaseConnected && _deviceNetworkAvailable != false) {
+      if (_activeSync != null) {
+        _syncRequestedAfterActive = true;
+        status.value = WordSyncStatus.pending;
+        lastError.value = 'Connection restored — a sync check is queued.';
+      } else if (status.value != WordSyncStatus.synced) {
+        unawaited(syncNow());
+      }
+      return;
+    }
+
+    if (_deviceNetworkAvailable == false) {
+      _setConnectionWaitingStatus();
+      _ensureRecoveryTimer(uid, generation);
+      return;
+    }
+
+    final now = DateTime.now();
+    final lastKick = _lastReconnectKickAt;
+    if (lastKick != null &&
+        now.difference(lastKick) < const Duration(seconds: 2)) {
+      _ensureRecoveryTimer(uid, generation);
+      return;
+    }
+    _lastReconnectKickAt = now;
+
+    debugPrint('[SYNC] Requesting Firebase reconnect.');
+    status.value = WordSyncStatus.reconnecting;
+    lastError.value = _deviceNetworkAvailable == true
+        ? 'Device network is available; reconnecting to Firebase.'
+        : 'Checking device network and Firebase connection.';
+    _ensureRecoveryTimer(uid, generation);
+    unawaited(_restartFirebaseConnectionListener(uid, generation));
+    unawaited(_pokeFirebaseConnection(uid, generation));
+  }
+
+  Future<void> _restartFirebaseConnectionListener(
+    String uid,
+    int generation,
+  ) async {
+    if (!_isCurrent(uid, generation) ||
+        _connectionListenerRestartInProgress) {
+      return;
+    }
+    _connectionListenerRestartInProgress = true;
+    final previous = _connectionSubscription;
+    _connectionSubscription = null;
+    _connectionListenerEpoch++;
+    try {
+      await previous?.cancel();
+      if (_isCurrent(uid, generation)) {
+        _attachFirebaseConnectionListener(uid, generation);
+      }
+    } catch (error) {
+      debugPrint('Error replacing Firebase connection listener: $error');
+      _scheduleFirebaseConnectionListenerRestart(uid, generation);
+    } finally {
+      _connectionListenerRestartInProgress = false;
+    }
+  }
+
+  void _scheduleFirebaseConnectionListenerRestart(
+    String uid,
+    int generation,
+  ) {
+    if (!_isCurrent(uid, generation) ||
+        _connectionListenerRestartTimer?.isActive == true) {
+      return;
+    }
+    _connectionListenerRestartTimer = Timer(
+      const Duration(seconds: 2),
+      () {
+        _connectionListenerRestartTimer = null;
+        unawaited(_restartFirebaseConnectionListener(uid, generation));
+      },
+    );
+  }
+
+  void _scheduleNetworkListenerRestart(String uid, int generation) {
+    if (!_isCurrent(uid, generation) ||
+        _networkListenerRestartTimer?.isActive == true) {
+      return;
+    }
+    _networkListenerRestartTimer = Timer(const Duration(seconds: 3), () {
+      _networkListenerRestartTimer = null;
+      if (!_isCurrent(uid, generation) ||
+          _networkListenerRestartInProgress) {
+        return;
+      }
+      _networkListenerRestartInProgress = true;
+      final previous = _networkSubscription;
+      _networkSubscription = null;
+      unawaited(() async {
+        try {
+          await previous?.cancel();
+        } catch (error) {
+          debugPrint('Error replacing device network listener: $error');
+        }
+        if (_isCurrent(uid, generation)) {
+          _attachNetworkListener(uid, generation);
+          await _refreshDeviceNetwork(uid, generation);
+        }
+        _networkListenerRestartInProgress = false;
+      }());
+    });
+  }
+
+  Future<void> _pokeFirebaseConnection(String uid, int generation) async {
+    if (!_isCurrent(uid, generation) || _firebaseProbeInProgress) return;
+    _firebaseProbeInProgress = true;
+    try {
+      // A small read prompts the Firebase SDK to resume its normal connection
+      // work. It is NOT treated as proof of connectivity because some clients
+      // may satisfy reads from cache while offline. Only .info/connected=true
+      // permits syncNow() to proceed.
+      await _wordStatesRef(uid)
+          .child('updatedAt')
+          .get()
+          .timeout(const Duration(seconds: 8));
+    } catch (error) {
+      debugPrint('Firebase reconnect probe did not complete: $error');
+    } finally {
+      _firebaseProbeInProgress = false;
+    }
+  }
+
+  void _ensureRecoveryTimer(String uid, int generation) {
+    if (!_isCurrent(uid, generation) || _recoveryTimer?.isActive == true) {
+      return;
+    }
+    // A low-frequency recovery check protects against missed plugin events or
+    // a stale/terminated Firebase stream. It performs no upload by itself.
+    _recoveryTimer = Timer.periodic(const Duration(seconds: 20), (timer) {
+      if (!_isCurrent(uid, generation)) {
+        timer.cancel();
+        if (identical(_recoveryTimer, timer)) _recoveryTimer = null;
+        return;
+      }
+      if (_firebaseConnected && _deviceNetworkAvailable != false) {
+        timer.cancel();
+        if (identical(_recoveryTimer, timer)) _recoveryTimer = null;
+        return;
+      }
+      unawaited(_runRecoveryCheck(uid, generation));
+    });
+  }
+
+  Future<void> _runRecoveryCheck(String uid, int generation) async {
+    if (!_isCurrent(uid, generation) || _recoveryCheckInProgress) return;
+    _recoveryCheckInProgress = true;
+    try {
+      await _refreshDeviceNetwork(uid, generation);
+      if (!_isCurrent(uid, generation) || _deviceNetworkAvailable != true) {
+        return;
+      }
+      if (_firebaseConnected) {
+        if (_activeSync == null && status.value != WordSyncStatus.synced) {
+          unawaited(syncNow());
+        }
+        return;
+      }
+      // Reattach the .info listener periodically in case its original stream
+      // terminated without a usable event, then issue a lightweight RTDB read.
+      await _restartFirebaseConnectionListener(uid, generation);
+      if (_isCurrent(uid, generation) && !_firebaseConnected) {
+        await _pokeFirebaseConnection(uid, generation);
+      }
+    } finally {
+      _recoveryCheckInProgress = false;
+    }
+  }
+
+  void _setConnectionWaitingStatus() {
+    if (_deviceNetworkAvailable == false) {
+      status.value = WordSyncStatus.offline;
+      lastError.value = store.hasLocalAccountCache
+          ? 'Device network: unavailable. Firebase: disconnected. Changes are saved locally for this account.'
+          : 'Device network: unavailable. Firebase: disconnected. Waiting for this account’s first cloud sync.';
+    } else if (_deviceNetworkAvailable == true) {
+      status.value = WordSyncStatus.reconnecting;
+      lastError.value =
+          'Device network: available. Firebase: not connected yet; checking reachability.';
+    } else {
+      status.value = WordSyncStatus.reconnecting;
+      lastError.value =
+          'Device network: checking. Firebase: connection not yet confirmed.';
+    }
   }
 
   void _onLocalRevision() {
@@ -125,10 +534,13 @@ class WordStateSyncService {
   void _recordLocalChange() {
     final uid = _uid;
     if (uid == null || _disposed) return;
-    status.value = WordSyncStatus.pending;
-    lastError.value = _firebaseConnected
-        ? null
-        : 'Changes are saved on this device and waiting for internet.';
+    if (_firebaseConnected && _deviceNetworkAvailable != false) {
+      status.value = WordSyncStatus.pending;
+      lastError.value = null;
+    } else {
+      _setConnectionWaitingStatus();
+      if (_uid != null) _ensureRecoveryTimer(_uid!, _accountGeneration);
+    }
     _retryTimer?.cancel();
     _debounce?.cancel();
     _debounce = Timer(const Duration(milliseconds: 1600), () {
@@ -142,10 +554,10 @@ class WordStateSyncService {
       _accountGeneration == generation &&
       store.activeAccountUid == uid;
 
-  /// Attempts immediately when Firebase is connected. Offline calls leave the
-  /// local snapshot untouched; the .info/connected listener retries later.
-  /// If a request is already active, this queues one follow-up attempt rather
-  /// than silently dropping the request or creating overlapping writes.
+  /// Attempts immediately when Firebase is confirmed connected and the
+  /// device monitor does not report no available network. Offline calls leave
+  /// the local snapshot untouched; network, Firebase and app-resume monitors
+  /// retry later. If a request is active, one follow-up attempt is queued.
   Future<void> syncNow() {
     final uid = _uid;
     if (uid == null || _disposed) return Future<void>.value();
@@ -153,7 +565,7 @@ class WordStateSyncService {
     if (active != null) {
       // Do not start overlapping reads/writes. Remember the request so it is
       // executed immediately after the active operation completes or times out.
-      if (_firebaseConnected) {
+      if (_firebaseConnected && _deviceNetworkAvailable != false) {
         _syncRequestedAfterActive = true;
         _retryTimer?.cancel();
         _debounce?.cancel();
@@ -162,9 +574,9 @@ class WordStateSyncService {
     }
 
     _debounce?.cancel();
-    if (!_firebaseConnected) {
-      status.value = WordSyncStatus.pending;
-      lastError.value = 'Waiting for an internet connection. Local data is safe.';
+    if (!_firebaseConnected || _deviceNetworkAvailable == false) {
+      _setConnectionWaitingStatus();
+      _ensureRecoveryTimer(uid, _accountGeneration);
       return Future<void>.value();
     }
 
@@ -178,7 +590,8 @@ class WordStateSyncService {
       _syncRequestedAfterActive = false;
       if (runQueuedAttempt &&
           _isCurrent(uid, generation) &&
-          _firebaseConnected) {
+          _firebaseConnected &&
+          _deviceNetworkAvailable != false) {
         // Schedule after the current future has fully settled and _activeSync
         // has been cleared. This is an immediate retry, not a backoff retry.
         _retryTimer?.cancel();
@@ -186,6 +599,7 @@ class WordStateSyncService {
         scheduleMicrotask(() {
           if (_isCurrent(uid, generation) &&
               _firebaseConnected &&
+              _deviceNetworkAvailable != false &&
               _activeSync == null) {
             unawaited(syncNow());
           }
@@ -198,6 +612,7 @@ class WordStateSyncService {
 
   Future<void> _performSync(String uid, int generation) async {
     if (!_isCurrent(uid, generation)) return;
+    debugPrint('[SYNC] Synchronization started.');
     status.value = WordSyncStatus.syncing;
     lastError.value = null;
 
@@ -397,14 +812,12 @@ class WordStateSyncService {
     } catch (error, stackTrace) {
       debugPrint('Word-state synchronization failed: $error\n$stackTrace');
       if (_isCurrent(uid, generation)) {
-        if (!_firebaseConnected) {
+        if (!_firebaseConnected || _deviceNetworkAvailable == false) {
           // A request may time out after a disconnection. Keep the state
-          // pending, not failed; the connection listener will immediately
-          // retry when Firebase confirms reconnection.
-          status.value = WordSyncStatus.pending;
-          lastError.value = store.hasLocalAccountCache
-              ? 'Offline — changes remain saved on this device.'
-              : 'Offline — waiting for the first cloud synchronization.';
+          // offline/reconnecting, not failed. Device and Firebase monitors
+          // will trigger a fresh attempt when the server is reachable.
+          _setConnectionWaitingStatus();
+          _ensureRecoveryTimer(uid, generation);
         } else {
           lastError.value = _friendlyError(error);
           status.value = WordSyncStatus.failed;
@@ -425,9 +838,9 @@ class WordStateSyncService {
     // A completed request is not enough to report Synced if the database
     // disconnected during it, or if a reconnect has already queued a fresh
     // validation pass.
-    if (!_firebaseConnected) {
-      status.value = WordSyncStatus.pending;
-      lastError.value = 'Offline — changes remain saved on this device.';
+    if (!_firebaseConnected || _deviceNetworkAvailable == false) {
+      _setConnectionWaitingStatus();
+      _ensureRecoveryTimer(_uid!, _accountGeneration);
       return;
     }
     if (_syncRequestedAfterActive) {
@@ -436,8 +849,11 @@ class WordStateSyncService {
       return;
     }
 
+    debugPrint('[SYNC] Latest word-state snapshot verified.');
     status.value = WordSyncStatus.synced;
     lastError.value = null;
+    _recoveryTimer?.cancel();
+    _recoveryTimer = null;
   }
 
   void _queueRevisionRetry(String uid, int generation) {
@@ -453,6 +869,7 @@ class WordStateSyncService {
     // A connection-restoration retry has priority over exponential backoff.
     if (!_isCurrent(uid, generation) ||
         !_firebaseConnected ||
+        _deviceNetworkAvailable == false ||
         _syncRequestedAfterActive) {
       return;
     }
@@ -461,7 +878,8 @@ class WordStateSyncService {
     if (_retryAttempt < delays.length - 1) _retryAttempt++;
     _retryTimer?.cancel();
     _retryTimer = Timer(Duration(seconds: seconds), () {
-      if (_isCurrent(uid, generation) && _firebaseConnected) {
+      if (_isCurrent(uid, generation) &&
+          _firebaseConnected) {
         unawaited(syncNow());
       }
     });
@@ -674,13 +1092,25 @@ class WordStateSyncService {
     _accountGeneration++;
     _debounce?.cancel();
     _retryTimer?.cancel();
-    final subscription = _connectionSubscription;
+    _recoveryTimer?.cancel();
+    _connectionListenerRestartTimer?.cancel();
+    _networkListenerRestartTimer?.cancel();
+    final connectionSubscription = _connectionSubscription;
+    final networkSubscription = _networkSubscription;
     _connectionSubscription = null;
+    _networkSubscription = null;
+    _lifecycleListener?.dispose();
+    _lifecycleListener = null;
     _detachListener();
     _uid = null;
     _firebaseConnected = false;
+    _deviceNetworkAvailable = null;
+    _networkCheckInProgress = false;
+    _firebaseProbeInProgress = false;
+    _recoveryCheckInProgress = false;
     _syncRequestedAfterActive = false;
-    await subscription?.cancel();
+    await connectionSubscription?.cancel();
+    await networkSubscription?.cancel();
     // Do not clear _activeSync before awaiting it. A second stop() call
     // (for example, a newly signed-in account starting while the previous
     // widget is disposing) must also wait for the same in-flight operation.

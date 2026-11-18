@@ -392,15 +392,20 @@ class _AccountButton extends StatelessWidget {
                   if (error == null || error.isEmpty) {
                     return const SizedBox.shrink();
                   }
-                  return Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: Text(
-                      'Details: $error',
-                      maxLines: 4,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: Colors.redAccent,
+                  return ValueListenableBuilder<WordSyncStatus>(
+                    valueListenable: syncService.status,
+                    builder: (context, currentStatus, _) => Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Text(
+                        'Details: $error',
+                        maxLines: 4,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: currentStatus == WordSyncStatus.failed
+                              ? Colors.redAccent
+                              : Colors.black54,
+                        ),
                       ),
                     ),
                   );
@@ -437,6 +442,8 @@ class _AccountButton extends StatelessWidget {
         WordSyncStatus.pending => Icons.cloud_upload_outlined,
         WordSyncStatus.syncing => Icons.sync,
         WordSyncStatus.failed => Icons.cloud_off_outlined,
+        WordSyncStatus.offline => Icons.cloud_off_outlined,
+        WordSyncStatus.reconnecting => Icons.sync,
       };
 
   String _statusText(WordSyncStatus status) => switch (status) {
@@ -444,6 +451,8 @@ class _AccountButton extends StatelessWidget {
         WordSyncStatus.pending => 'Pending sync',
         WordSyncStatus.syncing => 'Synchronizing…',
         WordSyncStatus.failed => 'Sync failed — local data is safe',
+        WordSyncStatus.offline => 'Offline — changes saved locally',
+        WordSyncStatus.reconnecting => 'Reconnecting to Firebase…',
       };
 }
 

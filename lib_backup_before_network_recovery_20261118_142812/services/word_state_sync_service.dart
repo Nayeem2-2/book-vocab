@@ -34,6 +34,10 @@ class WordStateSyncService {
   bool _listenerAttached = false;
   bool _applyingRemote = false;
   bool _firebaseConnected = false;
+  // A reconnect (or another explicit sync request) that occurs while a sync
+  // is running must not be lost. The current operation is allowed to finish
+  // or time out, then exactly one fresh attempt is started immediately.
+  bool _syncRequestedAfterActive = false;
   int _accountGeneration = 0;
   int _retryAttempt = 0;
 
@@ -57,6 +61,7 @@ class WordStateSyncService {
     _connectionSubscription = null;
     _detachListener();
     _activeSync = null;
+    _syncRequestedAfterActive = false;
     _uid = uid;
     _firebaseConnected = false;
     _retryAttempt = 0;
@@ -70,25 +75,38 @@ class WordStateSyncService {
       (event) {
         if (!_isCurrent(uid, generation)) return;
         final connected = event.snapshot.value == true;
+        final wasConnected = _firebaseConnected;
         _firebaseConnected = connected;
         if (connected) {
-          // Connectivity restoration should bypass the retry backoff.
+          // A confirmed Firebase reconnection always bypasses backoff. If an
+          // older operation is still awaiting a request/timeout, remember the
+          // request and start one fresh sync as soon as that operation settles.
           _retryTimer?.cancel();
           _retryAttempt = 0;
-          if (status.value != WordSyncStatus.syncing) {
-            unawaited(syncNow());
+          if (!wasConnected) {
+            _debounce?.cancel();
+            if (_activeSync != null) {
+              _syncRequestedAfterActive = true;
+              status.value = WordSyncStatus.pending;
+              lastError.value =
+                  'Connection restored — an immediate synchronization retry is queued.';
+            } else {
+              unawaited(syncNow());
+            }
           }
         } else {
           // A returning account may continue with its own previously synced
           // cache while offline. A brand-new account with no cache stays
           // read-only until its first successful cloud reconciliation.
           store.markCachedWordStatesReadyOffline();
-          if (status.value != WordSyncStatus.syncing) {
-            status.value = WordSyncStatus.pending;
-            lastError.value = store.hasLocalAccountCache
-                ? 'Offline — using this account’s saved progress.'
-                : 'Waiting for the first connection to load this account’s progress.';
-          }
+          _debounce?.cancel();
+          _retryTimer?.cancel();
+          // Show the offline state even if a request was in flight. That
+          // request cannot declare the account Synced while disconnected.
+          status.value = WordSyncStatus.pending;
+          lastError.value = store.hasLocalAccountCache
+              ? 'Offline — using this account’s saved progress.'
+              : 'Waiting for the first connection to load this account’s progress.';
         }
       },
       onError: (Object error) {
@@ -126,11 +144,22 @@ class WordStateSyncService {
 
   /// Attempts immediately when Firebase is connected. Offline calls leave the
   /// local snapshot untouched; the .info/connected listener retries later.
+  /// If a request is already active, this queues one follow-up attempt rather
+  /// than silently dropping the request or creating overlapping writes.
   Future<void> syncNow() {
     final uid = _uid;
     if (uid == null || _disposed) return Future<void>.value();
     final active = _activeSync;
-    if (active != null) return active;
+    if (active != null) {
+      // Do not start overlapping reads/writes. Remember the request so it is
+      // executed immediately after the active operation completes or times out.
+      if (_firebaseConnected) {
+        _syncRequestedAfterActive = true;
+        _retryTimer?.cancel();
+        _debounce?.cancel();
+      }
+      return active;
+    }
 
     _debounce?.cancel();
     if (!_firebaseConnected) {
@@ -142,7 +171,26 @@ class WordStateSyncService {
     final generation = _accountGeneration;
     late final Future<void> tracked;
     tracked = _performSync(uid, generation).whenComplete(() {
-      if (identical(_activeSync, tracked)) _activeSync = null;
+      if (!identical(_activeSync, tracked)) return;
+      _activeSync = null;
+
+      final runQueuedAttempt = _syncRequestedAfterActive;
+      _syncRequestedAfterActive = false;
+      if (runQueuedAttempt &&
+          _isCurrent(uid, generation) &&
+          _firebaseConnected) {
+        // Schedule after the current future has fully settled and _activeSync
+        // has been cleared. This is an immediate retry, not a backoff retry.
+        _retryTimer?.cancel();
+        _debounce?.cancel();
+        scheduleMicrotask(() {
+          if (_isCurrent(uid, generation) &&
+              _firebaseConnected &&
+              _activeSync == null) {
+            unawaited(syncNow());
+          }
+        });
+      }
     });
     _activeSync = tracked;
     return tracked;
@@ -349,9 +397,19 @@ class WordStateSyncService {
     } catch (error, stackTrace) {
       debugPrint('Word-state synchronization failed: $error\n$stackTrace');
       if (_isCurrent(uid, generation)) {
-        lastError.value = _friendlyError(error);
-        status.value = WordSyncStatus.failed;
-        _scheduleBackoffRetry(uid, generation);
+        if (!_firebaseConnected) {
+          // A request may time out after a disconnection. Keep the state
+          // pending, not failed; the connection listener will immediately
+          // retry when Firebase confirms reconnection.
+          status.value = WordSyncStatus.pending;
+          lastError.value = store.hasLocalAccountCache
+              ? 'Offline — changes remain saved on this device.'
+              : 'Offline — waiting for the first cloud synchronization.';
+        } else {
+          lastError.value = _friendlyError(error);
+          status.value = WordSyncStatus.failed;
+          _scheduleBackoffRetry(uid, generation);
+        }
       }
     }
   }
@@ -362,9 +420,24 @@ class WordStateSyncService {
   void _markSynced() {
     _retryAttempt = 0;
     _retryTimer?.cancel();
+    store.markWordStatesReady();
+
+    // A completed request is not enough to report Synced if the database
+    // disconnected during it, or if a reconnect has already queued a fresh
+    // validation pass.
+    if (!_firebaseConnected) {
+      status.value = WordSyncStatus.pending;
+      lastError.value = 'Offline — changes remain saved on this device.';
+      return;
+    }
+    if (_syncRequestedAfterActive) {
+      status.value = WordSyncStatus.pending;
+      lastError.value = 'Connection restored — checking the latest snapshot.';
+      return;
+    }
+
     status.value = WordSyncStatus.synced;
     lastError.value = null;
-    store.markWordStatesReady();
   }
 
   void _queueRevisionRetry(String uid, int generation) {
@@ -377,7 +450,12 @@ class WordStateSyncService {
   }
 
   void _scheduleBackoffRetry(String uid, int generation) {
-    if (!_isCurrent(uid, generation) || !_firebaseConnected) return;
+    // A connection-restoration retry has priority over exponential backoff.
+    if (!_isCurrent(uid, generation) ||
+        !_firebaseConnected ||
+        _syncRequestedAfterActive) {
+      return;
+    }
     const delays = <int>[2, 5, 15, 30, 60];
     final seconds = delays[_retryAttempt.clamp(0, delays.length - 1).toInt()];
     if (_retryAttempt < delays.length - 1) _retryAttempt++;
@@ -601,6 +679,7 @@ class WordStateSyncService {
     _detachListener();
     _uid = null;
     _firebaseConnected = false;
+    _syncRequestedAfterActive = false;
     await subscription?.cancel();
     // Do not clear _activeSync before awaiting it. A second stop() call
     // (for example, a newly signed-in account starting while the previous
