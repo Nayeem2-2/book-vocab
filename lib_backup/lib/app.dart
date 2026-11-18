@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
@@ -108,40 +110,73 @@ class _SignedInHome extends StatefulWidget {
 }
 
 class _SignedInHomeState extends State<_SignedInHome> {
-  late final Future<void> _initialSync;
+  bool _loadingLocalAccount = true;
+  String? _loadError;
 
   @override
   void initState() {
     super.initState();
-    widget.syncService.attachForUser(widget.user.uid);
-    _initialSync = widget.syncService.syncNow();
+    _activateLocalAccount();
+  }
+
+  Future<void> _activateLocalAccount() async {
+    try {
+      // Wait for any previous UID's in-flight sync to stop before changing the
+      // active local word-state set. This prevents an old download from
+      // mutating the new account's in-memory state during a quick account
+      // switch. stop() is safe when no account is currently attached.
+      await widget.syncService.stop();
+
+      // Activate only this UID's cache. This operation is local and does not
+      // wait for the network, so a returning user can open the app offline.
+      await widget.store.activateAccount(widget.user.uid);
+      if (!mounted) return;
+
+      widget.syncService.attachForUser(widget.user.uid);
+      setState(() => _loadingLocalAccount = false);
+
+      // Firebase synchronization runs in the background. If this account has
+      // no local cache, word-state editing remains locked until the first
+      // successful cloud check establishes this account's snapshot.
+      unawaited(widget.syncService.syncNow());
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loadError = error.toString();
+        _loadingLocalAccount = false;
+      });
+    }
   }
 
   @override
   void dispose() {
-    widget.syncService.stop();
+    unawaited(widget.syncService.stop());
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<void>(
-      future: _initialSync,
-      builder: (context, snapshot) {
-        if (snapshot.connectionState != ConnectionState.done) {
-          return const _LoadingScreen(
-            message: 'Synchronizing your vocabulary…',
-          );
-        }
-        return BooksPage(
-          store: widget.store,
-          trailingAction: _AccountButton(
-            user: widget.user,
-            authService: widget.authService,
-            syncService: widget.syncService,
+    if (_loadingLocalAccount) {
+      return const _LoadingScreen(message: 'Loading your local vocabulary…');
+    }
+    if (_loadError != null) {
+      return Scaffold(
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text('Could not load this account’s local data: $_loadError'),
           ),
-        );
-      },
+        ),
+      );
+    }
+    return BooksPage(
+      store: widget.store,
+      trailingAction: _AccountButton(
+        user: widget.user,
+        authService: widget.authService,
+        syncService: widget.syncService,
+        store: widget.store,
+      ),
     );
   }
 }
@@ -253,11 +288,79 @@ class _AccountButton extends StatelessWidget {
     required this.user,
     required this.authService,
     required this.syncService,
+    required this.store,
   });
 
   final User user;
   final GoogleAuthService authService;
   final WordStateSyncService syncService;
+  final BookStore store;
+
+  Future<void> _signOut(BuildContext context) async {
+    // Close the account dialog before doing network work.
+    Navigator.of(context).pop();
+    try {
+      await syncService.syncNow();
+      if (!context.mounted) return;
+      final hasPendingChanges = await store.hasUnsyncedWordStateChanges();
+      if (!context.mounted) return;
+
+      if (hasPendingChanges) {
+        final discard = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: const Text('Unsynchronized changes'),
+            content: const Text(
+              'Some vocabulary changes have not reached Firebase. '
+              'Signing out will discard those pending changes and restore '
+              'this account’s last successfully synchronized snapshot. '
+              'Previously synchronized progress will be kept.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.red.shade700,
+                ),
+                child: const Text('Discard and sign out'),
+              ),
+            ],
+          ),
+        );
+        if (discard != true) return;
+
+        await syncService.stop();
+        await store.restoreLastSyncedWordStates();
+      } else {
+        await syncService.stop();
+      }
+
+      // The account file remains on disk for the next time this UID signs in.
+      // Only the in-memory active word-state set is cleared.
+      await store.clearActiveAccountWordStates();
+      await authService.signOut();
+    } catch (error) {
+      // If recovery/sign-out fails, reload this UID's cache before restoring
+      // its sync listener. Never resume with a cleared in-memory snapshot.
+      if (store.activeAccountUid == null) {
+        try {
+          await store.activateAccount(user.uid);
+        } catch (restoreError) {
+          debugPrint('Could not restore the account cache after sign-out error: $restoreError');
+        }
+      }
+      syncService.attachForUser(user.uid);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not sign out safely: $error')),
+        );
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -275,11 +378,11 @@ class _AccountButton extends StatelessWidget {
               const SizedBox(height: 16),
               ValueListenableBuilder<WordSyncStatus>(
                 valueListenable: syncService.status,
-                builder: (context, status, _) => Row(
+                builder: (context, currentStatus, _) => Row(
                   children: [
-                    Icon(_statusIcon(status), size: 20),
+                    Icon(_statusIcon(currentStatus), size: 20),
                     const SizedBox(width: 9),
-                    Expanded(child: Text(_statusText(status))),
+                    Expanded(child: Text(_statusText(currentStatus))),
                   ],
                 ),
               ),
@@ -319,10 +422,7 @@ class _AccountButton extends StatelessWidget {
               child: const Text('Sync now'),
             ),
             TextButton(
-              onPressed: () async {
-                Navigator.pop(dialogContext);
-                await authService.signOut();
-              },
+              onPressed: () => _signOut(context),
               child: const Text('Sign out'),
             ),
           ],

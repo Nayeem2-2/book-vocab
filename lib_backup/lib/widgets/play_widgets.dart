@@ -20,6 +20,16 @@ Future<void> startGame(
   List<ChapterData> chapters, {
   PracticeCounts? initialCounts,
 }) async {
+  if (!store.wordStatesReady.value) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Connect to load this account’s saved word progress before starting a game.',
+        ),
+      ),
+    );
+    return;
+  }
   final counts = initialCounts ?? store.practiceCounts(chapters);
   if (counts.total == 0) return;
 
@@ -173,41 +183,71 @@ class PlayButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (book != null) {
-      // Whole-book statistics can cover hundreds of thousands of word
-      // entries. The shared Future yields between small chunks, so the list
-      // keeps responding while the index is prepared.
-      return ValueListenableBuilder<int>(
-        valueListenable: store.wordStateRevision,
-        builder: (context, _, __) => FutureBuilder<void>(
-          future: store.ensureBookWordCache(book!),
-          builder: (context, snapshot) {
-            final counts = store.cachedPracticeCountsForBook(book!);
-            if (counts == null) {
-              return SizedBox(
-                width: size + 16,
-                height: size + 16,
-                child: Padding(
-                  padding: const EdgeInsets.all(10),
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    color: _green.withOpacity(0.65),
-                  ),
-                ),
-              );
-            }
-            return _buildButton(context, counts);
-          },
-        ),
-      );
-    }
+    return ValueListenableBuilder<bool>(
+      valueListenable: store.wordStatesReady,
+      builder: (context, ready, _) {
+        if (!ready) {
+          return IconButton(
+            tooltip: 'Connect to load this account’s word progress',
+            onPressed: null,
+            icon: Icon(
+              Icons.play_circle_fill_rounded,
+              size: size,
+              color: _green.withOpacity(0.2),
+            ),
+          );
+        }
 
-    return ValueListenableBuilder<int>(
-      valueListenable: store.wordStateRevision,
-      builder: (context, _, __) => _buildButton(
-        context,
-        store.practiceCounts(chapters),
-      ),
+        if (book != null) {
+          // Whole-book statistics can cover hundreds of thousands of word
+          // entries. The shared Future yields between small chunks, so the list
+          // keeps responding while the index is prepared.
+          return ValueListenableBuilder<int>(
+            valueListenable: store.wordStateRevision,
+            builder: (context, _, __) => FutureBuilder<void>(
+              future: store.ensureBookWordCache(book!),
+              builder: (context, snapshot) {
+                final counts = store.cachedPracticeCountsForBook(book!);
+                if (snapshot.hasError) {
+                  // A failed index build must not leave an endless spinner.
+                  // A later state revision or rebuilt screen can retry it.
+                  return IconButton(
+                    tooltip: 'Could not calculate this book’s word counts',
+                    onPressed: null,
+                    icon: Icon(
+                      Icons.play_circle_fill_rounded,
+                      size: size,
+                      color: _green.withOpacity(0.2),
+                    ),
+                  );
+                }
+                if (counts == null) {
+                  return SizedBox(
+                    width: size + 16,
+                    height: size + 16,
+                    child: Padding(
+                      padding: const EdgeInsets.all(10),
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: _green.withOpacity(0.65),
+                      ),
+                    ),
+                  );
+                }
+                return _buildButton(context, counts);
+              },
+            ),
+          );
+        }
+
+        return ValueListenableBuilder<int>(
+          valueListenable: store.wordStateRevision,
+          builder: (context, _, __) => _buildButton(
+            context,
+            store.practiceCounts(chapters),
+          ),
+        );
+      },
     );
   }
 }
