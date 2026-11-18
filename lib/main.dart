@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'app.dart';
 import 'firebase_options.dart';
 import 'services/book_store.dart';
+import 'services/book_library_sync_service.dart';
 import 'services/google_auth_service.dart';
 import 'services/word_state_sync_service.dart';
 
@@ -19,10 +20,12 @@ Future<void> main() async {
 
   final authService = GoogleAuthService();
   final syncService = WordStateSyncService(store: store);
+  final librarySyncService = BookLibrarySyncService(store: store);
 
   runApp(VocabularyApp(
     store: store,
     authService: authService,
     syncService: syncService,
+    librarySyncService: librarySyncService,
   ));
 }

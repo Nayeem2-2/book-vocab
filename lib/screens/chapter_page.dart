@@ -5,9 +5,11 @@ import 'package:indexed_sliver_list/indexed_sliver_list.dart';
 
 import '../models/book_models.dart';
 import '../services/book_store.dart';
+import '../services/view_preferences_service.dart';
 import '../services/image_page_importer.dart';
 import '../widgets/alphabet_fast_scroller.dart';
 import '../widgets/play_widgets.dart';
+import '../widgets/view_settings_sheet.dart';
 import 'image_viewer_page.dart';
 
 class ChapterPage extends StatefulWidget {
@@ -47,6 +49,10 @@ class _ChapterPageState extends State<ChapterPage> {
   final Map<String, Map<String, List<WordEntry>>> _groupedWordCache = {};
   _VocabularyListModel? _visibleListCache;
   String? _visibleListCacheKey;
+  BrowseLayout _viewLayout = BrowseLayout.list;
+  int _listSize = 3;
+  int _gridSize = 3;
+  int get _viewSize => _viewLayout == BrowseLayout.list ? _listSize : _gridSize;
 
   bool get _isImageBook => widget.book.isImageBook;
 
@@ -68,6 +74,7 @@ class _ChapterPageState extends State<ChapterPage> {
     _currentIndex = widget.pageIndex
         .clamp(0, _navigationPages.isEmpty ? 0 : _navigationPages.length - 1)
         .toInt();
+    _loadViewPreferences();
   }
 
   @override
@@ -255,9 +262,98 @@ class _ChapterPageState extends State<ChapterPage> {
     );
   }
 
+  Future<void> _loadViewPreferences() async {
+    final preference = await ViewPreferencesService.load('vocabulary');
+    if (!mounted) return;
+    setState(() {
+      _viewLayout = preference.layout;
+      _listSize = preference.listSize;
+      _gridSize = preference.gridSize;
+      _visibleListCache = null;
+    });
+  }
+
+  void _updateViewPreference(BrowseViewPreference preference) {
+    final layoutChanged = preference.layout != _viewLayout;
+    if (layoutChanged) {
+      // List and Grid have different virtual row counts. Reset the indexed
+      // controller when changing layouts so an old List index cannot point
+      // beyond the shorter Grid row set (or vice versa).
+      _resetWordScrollController();
+    }
+    setState(() {
+      _viewLayout = preference.layout;
+      _listSize = preference.listSize;
+      _gridSize = preference.gridSize;
+      _visibleListCache = null;
+      _visibleListCacheKey = null;
+    });
+    unawaited(ViewPreferencesService.save('vocabulary', preference));
+  }
+
+  Future<void> _openViewSettings() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: false,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+      ),
+      builder: (_) => ViewSettingsSheet(
+        preference: BrowseViewPreference(
+          layout: _viewLayout, listSize: _listSize, gridSize: _gridSize,
+        ),
+        description: 'Choose how vocabulary words and meanings are arranged.',
+        onChanged: _updateViewPreference,
+        previewBuilder: _vocabularySettingsPreview,
+      ),
+    );
+  }
+
+  Widget _vocabularySettingsPreview(BrowseViewPreference preference) {
+    final entries = _currentChapter.words.take(2).toList(growable: false);
+    final first = entries.isNotEmpty
+        ? entries.first
+        : WordEntry(word: 'Beautiful', meanings: const ['সুন্দর', 'মনোরম']);
+    final second = entries.length > 1
+        ? entries[1]
+        : WordEntry(word: 'Adventure', meanings: const ['অভিযান', 'রোমাঞ্চ']);
+    Widget card(WordEntry entry) => Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: EdgeInsets.all(8 + preference.size.toDouble()),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(entry.word, style: TextStyle(fontWeight: FontWeight.w800,
+                fontSize: preference.layout == BrowseLayout.grid ? 13 + preference.size * .3 : 16)),
+            const SizedBox(height: 4),
+            Text(entry.meanings.join(' • '), maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: preference.layout == BrowseLayout.grid ? 11 + preference.size * .25 : 14)),
+            const SizedBox(height: 6),
+            const Align(alignment: Alignment.centerRight,
+                child: Icon(Icons.radio_button_unchecked, size: 19)),
+          ],
+        ),
+      ),
+    );
+    if (preference.layout == BrowseLayout.grid) {
+      return Row(children: [
+        Expanded(child: card(first)),
+        const SizedBox(width: 8),
+        Expanded(child: card(second)),
+      ]);
+    }
+    return Column(children: [card(first), const SizedBox(height: 7), card(second)]);
+  }
+
   _VocabularyListModel _visibleListFor(ChapterData chapter) {
     final normalizedQuery = query.trim().toLowerCase();
-    final cacheKey = '${chapter.stableId}|${chapter.words.length}|$normalizedQuery|$_isImageBook';
+    final cacheKey = '${chapter.stableId}|${chapter.words.length}|$normalizedQuery|$_isImageBook|$_viewLayout|$_viewSize';
     final cached = _visibleListCache;
     if (cached != null && _visibleListCacheKey == cacheKey) return cached;
 
@@ -277,12 +373,14 @@ class _ChapterPageState extends State<ChapterPage> {
 
         final headerLetter = group.key == '#' ? null : group.key;
         if (headerLetter != null) letterIndexes[headerLetter] = itemCount;
-        sections.add(_VocabularySection(
+        final section = _VocabularySection(
           letter: headerLetter,
           words: visibleWords,
           startIndex: itemCount,
-        ));
-        itemCount += visibleWords.length + (headerLetter == null ? 0 : 1);
+          isGrid: _viewLayout == BrowseLayout.grid,
+        );
+        sections.add(section);
+        itemCount += section.rowCount;
       }
     } else {
       // JSON books deliberately preserve their original source order.
@@ -292,12 +390,14 @@ class _ChapterPageState extends State<ChapterPage> {
               .where((entry) => _matchesWord(entry, normalizedQuery))
               .toList(growable: false);
       if (visibleWords.isNotEmpty) {
-        sections.add(_VocabularySection(
+        final section = _VocabularySection(
           letter: null,
           words: visibleWords,
           startIndex: 0,
-        ));
-        itemCount = visibleWords.length;
+          isGrid: _viewLayout == BrowseLayout.grid,
+        );
+        sections.add(section);
+        itemCount = section.rowCount;
       }
     }
 
@@ -305,6 +405,7 @@ class _ChapterPageState extends State<ChapterPage> {
       sections: sections,
       letterIndexes: letterIndexes,
       itemCount: itemCount,
+      isGrid: _viewLayout == BrowseLayout.grid,
     );
     _visibleListCacheKey = cacheKey;
     _visibleListCache = model;
@@ -344,7 +445,7 @@ class _ChapterPageState extends State<ChapterPage> {
     );
   }
 
-  Widget _wordCard(WordEntry entry) {
+  Widget _wordCard(WordEntry entry, {bool grid = false}) {
     return ValueListenableBuilder<bool>(
       valueListenable: widget.store.wordStatesReady,
       builder: (context, ready, _) => ValueListenableBuilder<WordState>(
@@ -353,8 +454,77 @@ class _ChapterPageState extends State<ChapterPage> {
           if (state == WordState.known && !showKnown) {
             return const SizedBox.shrink();
           }
-          return _buildWordCard(entry, state, wordStatesReady: ready);
+          return _buildWordCard(entry, state, wordStatesReady: ready, grid: grid);
         },
+      ),
+    );
+  }
+
+  Widget _stateActionButton(
+    WordEntry entry,
+    WordState state,
+    bool ready, {
+    required bool grid,
+    required bool showAgainAction,
+  }) {
+    if (showAgainAction) {
+      return IconButton(
+        visualDensity: grid ? VisualDensity.compact : VisualDensity.standard,
+        constraints: grid ? const BoxConstraints.tightFor(width: 34, height: 34) : null,
+        padding: grid ? EdgeInsets.zero : null,
+        tooltip: ready ? 'Mark as Show Again' : 'Connect to load this account’s progress',
+        onPressed: !ready ? null : () {
+          widget.store.setWordState(entry.word, WordState.showAgain);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Flagged for Show Again'),
+                duration: Duration(milliseconds: 600)),
+          );
+        },
+        icon: Icon(
+          state == WordState.showAgain
+              ? Icons.replay_circle_filled_rounded
+              : Icons.replay,
+          color: state == WordState.showAgain
+              ? const Color(0xFFD97706)
+              : Colors.black38,
+          size: grid ? 20 : 26,
+        ),
+      );
+    }
+    return IconButton(
+      visualDensity: grid ? VisualDensity.compact : VisualDensity.standard,
+      constraints: grid ? const BoxConstraints.tightFor(width: 34, height: 34) : null,
+      padding: grid ? EdgeInsets.zero : null,
+      tooltip: !ready
+          ? 'Connect to load this account’s progress'
+          : state == WordState.known ? 'Mark unknown' : 'Mark known',
+      onPressed: !ready ? null : () {
+        final next = state == WordState.known
+            ? WordState.unknown
+            : WordState.known;
+        widget.store.setWordState(entry.word, next);
+        if (next == WordState.known) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Row(children: [
+                Icon(Icons.auto_awesome, color: Colors.amber, size: 18),
+                SizedBox(width: 8),
+                Text('✨ Marked as Known!'),
+              ]),
+              duration: Duration(milliseconds: 800),
+              backgroundColor: Color(0xFF27845B),
+            ),
+          );
+        }
+      },
+      icon: Icon(
+        state == WordState.known
+            ? Icons.check_circle_rounded
+            : Icons.radio_button_unchecked,
+        color: state == WordState.known
+            ? const Color(0xFF27845B)
+            : Colors.black38,
+        size: grid ? 20 : 28,
       ),
     );
   }
@@ -363,6 +533,7 @@ class _ChapterPageState extends State<ChapterPage> {
     WordEntry entry,
     WordState state, {
     required bool wordStatesReady,
+    bool grid = false,
   }) {
     final badgeColor = state == WordState.known
         ? const Color(0xFF27845B)
@@ -374,6 +545,109 @@ class _ChapterPageState extends State<ChapterPage> {
         : state == WordState.showAgain
             ? 'SHOW AGAIN'
             : '';
+
+    final content = grid
+        ? Card(
+            margin: EdgeInsets.zero,
+            child: Padding(
+              padding: EdgeInsets.all(8 + _viewSize.toDouble()),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(entry.word,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 13 + _viewSize * .35,
+                          fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 5),
+                  Expanded(
+                    child: Text(
+                      entry.meanings.isEmpty
+                          ? 'বাংলা অর্থ পাওয়া যায়নি'
+                          : entry.meanings.join('  •  '),
+                      maxLines: _viewSize >= 4 ? 6 : 4,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11 + _viewSize * .3,
+                        height: 1.35,
+                        color: entry.meanings.isEmpty
+                            ? Colors.black38
+                            : const Color(0xFF426B59),
+                      ),
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      if (badgeText.isNotEmpty)
+                        Expanded(
+                          child: Text(badgeText,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(color: badgeColor,
+                                  fontSize: 9, fontWeight: FontWeight.w800)),
+                        )
+                      else
+                        const Spacer(),
+                      _stateActionButton(entry, state, wordStatesReady,
+                          grid: true, showAgainAction: true),
+                      _stateActionButton(entry, state, wordStatesReady,
+                          grid: true, showAgainAction: false),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          )
+        : Card(
+            child: Padding(
+              padding: EdgeInsets.fromLTRB(
+                10 + (_viewSize * 1.2),
+                7 + (_viewSize * 1.2),
+                6 + (_viewSize * 0.5),
+                7 + (_viewSize * 1.2),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          entry.word,
+                          style: TextStyle(
+                            fontSize: 14 + (_viewSize * 0.8),
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 5),
+                        Text(
+                          entry.meanings.isEmpty ? 'বাংলা অর্থ পাওয়া যায়নি' : entry.meanings.join('  •  '),
+                          style: TextStyle(
+                            fontSize: 12 + (_viewSize * 0.6),
+                            height: 1.4,
+                            color: entry.meanings.isEmpty
+                                ? Colors.black38
+                                : const Color(0xFF426B59),
+                          ),
+                        ),
+                        if (badgeText.isNotEmpty && (showKnown || state == WordState.showAgain))
+                          Padding(
+                            padding: const EdgeInsets.only(top: 5),
+                            child: Text(badgeText, style: TextStyle(color: badgeColor,
+                                fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 1)),
+                          ),
+                      ],
+                    ),
+                  ),
+                  _stateActionButton(entry, state, wordStatesReady,
+                      grid: false, showAgainAction: false),
+                  _stateActionButton(entry, state, wordStatesReady,
+                      grid: false, showAgainAction: true),
+                ],
+              ),
+            ),
+          );
 
     return Dismissible(
       key: ValueKey('${_currentChapter.stableId}:${entry.word}'),
@@ -395,160 +669,31 @@ class _ChapterPageState extends State<ChapterPage> {
           color: const Color(0xFF27845B).withOpacity(0.2),
           borderRadius: BorderRadius.circular(18),
         ),
-        child: const Row(
-          mainAxisAlignment: MainAxisAlignment.end,
-          children: [
-            Text(
-              'Known',
-              style: TextStyle(
-                color: Color(0xFF27845B),
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            SizedBox(width: 8),
-            Icon(Icons.check_circle, color: Color(0xFF27845B)),
-          ],
-        ),
+        child: const Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+          Text('Known', style: TextStyle(color: Color(0xFF27845B), fontWeight: FontWeight.bold)),
+          SizedBox(width: 8),
+          Icon(Icons.check_circle, color: Color(0xFF27845B)),
+        ]),
       ),
       confirmDismiss: (direction) async {
-        if (state == WordState.known &&
-            direction == DismissDirection.startToEnd) {
+        if (state == WordState.known && direction == DismissDirection.startToEnd) {
           widget.store.setWordState(entry.word, WordState.showAgain);
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Moved to Show Again'),
-              duration: Duration(milliseconds: 600),
-            ),
-          );
-        } else if (state != WordState.known &&
-            direction == DismissDirection.endToStart) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text('Moved to Show Again'), duration: Duration(milliseconds: 600)));
+        } else if (state != WordState.known && direction == DismissDirection.endToStart) {
           widget.store.setWordState(entry.word, WordState.known);
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Row(
-                children: [
-                  Icon(Icons.auto_awesome, color: Colors.amber, size: 18),
-                  SizedBox(width: 8),
-                  Text('✨ Marked as Known!'),
-                ],
-              ),
-              duration: Duration(milliseconds: 800),
-              backgroundColor: Color(0xFF27845B),
-            ),
-          );
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Row(children: [
+              Icon(Icons.auto_awesome, color: Colors.amber, size: 18),
+              SizedBox(width: 8), Text('✨ Marked as Known!'),
+            ]),
+            duration: Duration(milliseconds: 800),
+            backgroundColor: Color(0xFF27845B),
+          ));
         }
         return false;
       },
-      child: Card(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 13, 8, 13),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      entry.word,
-                      style: const TextStyle(
-                        fontSize: 17,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 5),
-                    Text(
-                      entry.meanings.isEmpty
-                          ? 'বাংলা অর্থ পাওয়া যায়নি'
-                          : entry.meanings.join('  •  '),
-                      style: TextStyle(
-                        fontSize: 15,
-                        height: 1.45,
-                        color: entry.meanings.isEmpty
-                            ? Colors.black38
-                            : const Color(0xFF426B59),
-                      ),
-                    ),
-                    if (badgeText.isNotEmpty &&
-                        (showKnown || state == WordState.showAgain))
-                      Padding(
-                        padding: const EdgeInsets.only(top: 5),
-                        child: Text(
-                          badgeText,
-                          style: TextStyle(
-                            color: badgeColor,
-                            fontSize: 10,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: 1,
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-              IconButton(
-                tooltip: !wordStatesReady
-                    ? 'Connect to load this account’s progress'
-                    : state == WordState.known ? 'Mark unknown' : 'Mark known',
-                onPressed: !wordStatesReady ? null : () {
-                  final next = state == WordState.known
-                      ? WordState.unknown
-                      : WordState.known;
-                  widget.store.setWordState(entry.word, next);
-                  if (next == WordState.known) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Row(
-                          children: [
-                            Icon(Icons.auto_awesome,
-                                color: Colors.amber, size: 18),
-                            SizedBox(width: 8),
-                            Text('✨ Marked as Known!'),
-                          ],
-                        ),
-                        duration: Duration(milliseconds: 800),
-                        backgroundColor: Color(0xFF27845B),
-                      ),
-                    );
-                  }
-                },
-                icon: Icon(
-                  state == WordState.known
-                      ? Icons.check_circle_rounded
-                      : Icons.radio_button_unchecked,
-                  color: state == WordState.known
-                      ? const Color(0xFF27845B)
-                      : Colors.black38,
-                  size: 28,
-                ),
-              ),
-              IconButton(
-                tooltip: wordStatesReady
-                    ? 'Mark as Show Again'
-                    : 'Connect to load this account’s progress',
-                onPressed: !wordStatesReady ? null : () {
-                  widget.store.setWordState(entry.word, WordState.showAgain);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Flagged for Show Again'),
-                      duration: Duration(milliseconds: 600),
-                    ),
-                  );
-                },
-                icon: Icon(
-                  state == WordState.showAgain
-                      ? Icons.replay_circle_filled_rounded
-                      : Icons.replay,
-                  color: state == WordState.showAgain
-                      ? const Color(0xFFD97706)
-                      : Colors.black38,
-                  size: 26,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
+      child: content,
     );
   }
 
@@ -651,6 +796,23 @@ class _ChapterPageState extends State<ChapterPage> {
               onPressed: _openImageViewer,
               icon: const Icon(Icons.image_outlined),
             ),
+          PopupMenuButton<String>(
+            tooltip: 'More options',
+            icon: const Icon(Icons.more_vert),
+            onSelected: (value) {
+              if (value == 'view') _openViewSettings();
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(
+                value: 'view',
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.dashboard_customize_outlined),
+                  title: Text('View options'),
+                ),
+              ),
+            ],
+          ),
           PlayButton(
             store: widget.store,
             title: currentChapter.title,
@@ -765,18 +927,38 @@ class _ChapterPageState extends State<ChapterPage> {
                           child: IndexedListView(
                             controller: _wordScrollController,
                             padding: const EdgeInsets.fromLTRB(16, 4, 42, 112),
-                            estimatedItemExtent: 112,
+                            estimatedItemExtent: _viewLayout == BrowseLayout.grid
+                                ? 210.0 + (_viewSize * 12.0)
+                                : 112.0 + (_viewSize * 8.0),
                             itemCount: rows.itemCount,
                             addAutomaticKeepAlives: false,
                             itemBuilder: (context, index) {
                               final row = rows.rowAt(index, currentChapter.stableId);
                               final child = row.letter != null
                                   ? _letterHeader(row.letter!)
-                                  : Padding(
-                                      padding:
-                                          const EdgeInsets.only(bottom: 8),
-                                      child: _wordCard(row.entry!),
-                                    );
+                                  : _viewLayout == BrowseLayout.grid
+                                      ? Padding(
+                                          padding: const EdgeInsets.only(bottom: 9),
+                                          child: SizedBox(
+                                            height: 190.0 + (_viewSize * 15.0),
+                                            child: Row(
+                                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                                              children: [
+                                              Expanded(child: _wordCard(row.entries[0], grid: true)),
+                                              const SizedBox(width: 9),
+                                              Expanded(
+                                                child: row.entries.length > 1
+                                                    ? _wordCard(row.entries[1], grid: true)
+                                                    : const SizedBox.shrink(),
+                                              ),
+                                              ],
+                                            ),
+                                          ),
+                                        )
+                                      : Padding(
+                                          padding: const EdgeInsets.only(bottom: 8),
+                                          child: _wordCard(row.entries.first),
+                                        );
                               return KeyedSubtree(key: row.key, child: child);
                             },
                           ),
@@ -881,12 +1063,14 @@ class _VocabularySection {
     required this.letter,
     required this.words,
     required this.startIndex,
+    required this.isGrid,
   });
 
   final String? letter;
   final List<WordEntry> words;
   final int startIndex;
-  int get rowCount => words.length + (letter == null ? 0 : 1);
+  final bool isGrid;
+  int get rowCount => (letter == null ? 0 : 1) + (isGrid ? (words.length + 1) ~/ 2 : words.length);
 }
 
 class _VocabularyListModel {
@@ -894,11 +1078,13 @@ class _VocabularyListModel {
     required this.sections,
     required this.letterIndexes,
     required this.itemCount,
+    required this.isGrid,
   });
 
   final List<_VocabularySection> sections;
   final Map<String, int> letterIndexes;
   final int itemCount;
+  final bool isGrid;
 
   _VocabularyRow rowAt(int index, String chapterId) {
     var low = 0;
@@ -916,7 +1102,12 @@ class _VocabularyListModel {
           return _VocabularyRow.header(section.letter!);
         }
         final wordIndex = localIndex - (section.letter == null ? 0 : 1);
-        return _VocabularyRow.word(chapterId, section.words[wordIndex]);
+        if (isGrid) {
+          final start = wordIndex * 2;
+          final end = (start + 2).clamp(0, section.words.length).toInt();
+          return _VocabularyRow.words(chapterId, section.words.sublist(start, end));
+        }
+        return _VocabularyRow.words(chapterId, [section.words[wordIndex]]);
       }
     }
     throw RangeError.index(index, sections, 'index');
@@ -924,23 +1115,23 @@ class _VocabularyListModel {
 }
 
 class _VocabularyRow {
-  const _VocabularyRow._({this.letter, this.entry, required this.key});
+  const _VocabularyRow._({this.letter, this.entries = const [], required this.key});
 
   factory _VocabularyRow.header(String letter) => _VocabularyRow._(
         letter: letter,
         key: ValueKey<String>('header:$letter'),
       );
 
-  factory _VocabularyRow.word(String chapterId, WordEntry entry) =>
+  factory _VocabularyRow.words(String chapterId, List<WordEntry> entries) =>
       _VocabularyRow._(
-        entry: entry,
+        entries: entries,
         key: ValueKey<String>(
-          'word:$chapterId:${BookStore.normalizeWord(entry.word)}',
+          'words:$chapterId:${entries.map((entry) => BookStore.normalizeWord(entry.word)).join('|')}',
         ),
       );
 
   final String? letter;
-  final WordEntry? entry;
+  final List<WordEntry> entries;
   final Key key;
 }
 

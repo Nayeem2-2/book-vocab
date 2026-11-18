@@ -23,6 +23,7 @@ class ChapterData {
     this.id,
     this.pageNumber = 1,
     this.isDefaultName = false,
+    this.description = '',
   });
 
   // Mutable so renaming a page preserves its identity and all live references.
@@ -38,6 +39,9 @@ class ChapterData {
   /// True when title was generated from the page number by the app.
   /// Renumbering can safely keep these default titles in sync.
   bool isDefaultName;
+
+  /// User-authored description for scanned image-book pages.
+  String description;
 
   /// Stable identity for image pages, including pages loaded from older metadata.
   String get stableId => id ?? imagePath ?? '$title|$pageRange';
@@ -59,6 +63,8 @@ class BookData {
     required this.jsonPath,
     this.isImageBook = false,
     this.pages = const [],
+    this.ownerUid,
+    this.modifiedAt = 0,
   });
 
   final String id;
@@ -68,6 +74,12 @@ class BookData {
   final String jsonPath;
   final bool isImageBook;
   final List<ChapterData> pages;
+
+  /// Null for pre-account legacy books that remain device-local.
+  final String? ownerUid;
+
+  /// Server-adjusted modification timestamp used for per-book LWW sync.
+  int modifiedAt;
 
   List<ChapterData> get allChapters =>
       isImageBook ? pages : [for (final p in parts) ...p.chapters];

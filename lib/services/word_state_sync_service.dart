@@ -630,11 +630,14 @@ class WordStateSyncService {
       var serverOffset = prefs.getInt(_serverOffsetKey) ?? 0;
       var receivedFreshOffset = false;
       try {
-        final offsetSnapshot = await _database
+        // .info/serverTimeOffset is documented as a value-listener location.
+        // Use the initial stream event rather than a one-shot Query.get().
+        final offsetEvent = await _database
             .ref('.info/serverTimeOffset')
-            .get()
+            .onValue
+            .first
             .timeout(const Duration(seconds: 5));
-        final value = offsetSnapshot.value;
+        final value = offsetEvent.snapshot.value;
         if (value is num) {
           serverOffset = value.toInt();
           receivedFreshOffset = true;

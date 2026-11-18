@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import 'screens/books_page.dart';
 import 'services/book_store.dart';
+import 'services/book_library_sync_service.dart';
 import 'services/google_auth_service.dart';
 import 'services/word_state_sync_service.dart';
 
@@ -14,11 +15,13 @@ class VocabularyApp extends StatelessWidget {
     required this.store,
     required this.authService,
     required this.syncService,
+    this.librarySyncService,
   });
 
   final BookStore store;
   final GoogleAuthService authService;
   final WordStateSyncService syncService;
+  final BookLibrarySyncService? librarySyncService;
 
   @override
   Widget build(BuildContext context) {
@@ -50,6 +53,7 @@ class VocabularyApp extends StatelessWidget {
         store: store,
         authService: authService,
         syncService: syncService,
+        librarySyncService: librarySyncService,
       ),
     );
   }
@@ -60,11 +64,13 @@ class _AuthenticationGate extends StatelessWidget {
     required this.store,
     required this.authService,
     required this.syncService,
+    this.librarySyncService,
   });
 
   final BookStore store;
   final GoogleAuthService authService;
   final WordStateSyncService syncService;
+  final BookLibrarySyncService? librarySyncService;
 
   @override
   Widget build(BuildContext context) {
@@ -85,6 +91,7 @@ class _AuthenticationGate extends StatelessWidget {
           store: store,
           authService: authService,
           syncService: syncService,
+          librarySyncService: librarySyncService,
         );
       },
     );
@@ -98,12 +105,14 @@ class _SignedInHome extends StatefulWidget {
     required this.store,
     required this.authService,
     required this.syncService,
+    this.librarySyncService,
   });
 
   final User user;
   final BookStore store;
   final GoogleAuthService authService;
   final WordStateSyncService syncService;
+  final BookLibrarySyncService? librarySyncService;
 
   @override
   State<_SignedInHome> createState() => _SignedInHomeState();
@@ -126,19 +135,24 @@ class _SignedInHomeState extends State<_SignedInHome> {
       // mutating the new account's in-memory state during a quick account
       // switch. stop() is safe when no account is currently attached.
       await widget.syncService.stop();
+      await widget.librarySyncService?.stop();
 
       // Activate only this UID's cache. This operation is local and does not
       // wait for the network, so a returning user can open the app offline.
       await widget.store.activateAccount(widget.user.uid);
+      await widget.store.activateLibraryAccount(widget.user.uid);
       if (!mounted) return;
 
       widget.syncService.attachForUser(widget.user.uid);
+      widget.librarySyncService?.attachForUser(widget.user.uid);
       setState(() => _loadingLocalAccount = false);
 
       // Firebase synchronization runs in the background. If this account has
       // no local cache, word-state editing remains locked until the first
       // successful cloud check establishes this account's snapshot.
       unawaited(widget.syncService.syncNow());
+      // BookLibrarySyncService starts its initial check when its Firebase
+      // connection listener reports connected; avoid queuing a duplicate run.
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -151,6 +165,9 @@ class _SignedInHomeState extends State<_SignedInHome> {
   @override
   void dispose() {
     unawaited(widget.syncService.stop());
+    if (widget.librarySyncService != null) {
+      unawaited(widget.librarySyncService!.stop());
+    }
     super.dispose();
   }
 
@@ -175,6 +192,7 @@ class _SignedInHomeState extends State<_SignedInHome> {
         user: widget.user,
         authService: widget.authService,
         syncService: widget.syncService,
+        librarySyncService: widget.librarySyncService,
         store: widget.store,
       ),
     );
@@ -289,11 +307,13 @@ class _AccountButton extends StatelessWidget {
     required this.authService,
     required this.syncService,
     required this.store,
+    this.librarySyncService,
   });
 
   final User user;
   final GoogleAuthService authService;
   final WordStateSyncService syncService;
+  final BookLibrarySyncService? librarySyncService;
   final BookStore store;
 
   Future<void> _signOut(BuildContext context) async {
@@ -301,6 +321,7 @@ class _AccountButton extends StatelessWidget {
     Navigator.of(context).pop();
     try {
       await syncService.syncNow();
+      await librarySyncService?.syncNow();
       if (!context.mounted) return;
       final hasPendingChanges = await store.hasUnsyncedWordStateChanges();
       if (!context.mounted) return;
@@ -334,9 +355,11 @@ class _AccountButton extends StatelessWidget {
         if (discard != true) return;
 
         await syncService.stop();
+        await librarySyncService?.stop();
         await store.restoreLastSyncedWordStates();
       } else {
         await syncService.stop();
+        await librarySyncService?.stop();
       }
 
       // The account file remains on disk for the next time this UID signs in.
@@ -354,6 +377,7 @@ class _AccountButton extends StatelessWidget {
         }
       }
       syncService.attachForUser(user.uid);
+      librarySyncService?.attachForUser(user.uid);
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Could not sign out safely: $error')),
@@ -411,9 +435,36 @@ class _AccountButton extends StatelessWidget {
                   );
                 },
               ),
+              if (librarySyncService != null) ...[
+                const SizedBox(height: 12),
+                const Divider(),
+                const Text('Books and pages', style: TextStyle(fontWeight: FontWeight.w700)),
+                const SizedBox(height: 6),
+                ValueListenableBuilder<LibrarySyncStatus>(
+                  valueListenable: librarySyncService!.status,
+                  builder: (context, libraryStatus, _) => Row(
+                    children: [
+                      Icon(_libraryStatusIcon(libraryStatus), size: 19),
+                      const SizedBox(width: 8),
+                      Text(_libraryStatusText(libraryStatus)),
+                    ],
+                  ),
+                ),
+                ValueListenableBuilder<String?>(
+                  valueListenable: librarySyncService!.lastError,
+                  builder: (context, error, _) => error == null || error.isEmpty
+                      ? const SizedBox.shrink()
+                      : Padding(
+                          padding: const EdgeInsets.only(top: 5),
+                          child: Text('Library: $error', maxLines: 3,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 11, color: Colors.redAccent)),
+                        ),
+                ),
+              ],
               const SizedBox(height: 8),
               const Text(
-                'Only Known and Show Again word states are synchronized.',
+                'Word progress and account-owned books/pages are synchronized. Original scanned images remain on this device.',
                 style: TextStyle(fontSize: 12, color: Colors.black54),
               ),
             ],
@@ -423,6 +474,7 @@ class _AccountButton extends StatelessWidget {
               onPressed: () {
                 Navigator.pop(dialogContext);
                 syncService.syncNow();
+                librarySyncService?.syncNow(userInitiated: true);
               },
               child: const Text('Sync now'),
             ),
@@ -435,6 +487,39 @@ class _AccountButton extends StatelessWidget {
       ),
       icon: const Icon(Icons.account_circle_outlined),
     );
+  }
+
+  IconData _libraryStatusIcon(LibrarySyncStatus status) {
+    switch (status) {
+      case LibrarySyncStatus.synced:
+        return Icons.cloud_done_outlined;
+      case LibrarySyncStatus.pending:
+        return Icons.cloud_upload_outlined;
+      case LibrarySyncStatus.syncing:
+      case LibrarySyncStatus.retrying:
+        return Icons.sync_rounded;
+      case LibrarySyncStatus.offline:
+        return Icons.cloud_off_outlined;
+      case LibrarySyncStatus.failed:
+        return Icons.error_outline;
+    }
+  }
+
+  String _libraryStatusText(LibrarySyncStatus status) {
+    switch (status) {
+      case LibrarySyncStatus.synced:
+        return 'Library synced';
+      case LibrarySyncStatus.pending:
+        return 'Library changes pending';
+      case LibrarySyncStatus.syncing:
+        return 'Synchronizing books and pages…';
+      case LibrarySyncStatus.retrying:
+        return 'Retrying library sync…';
+      case LibrarySyncStatus.offline:
+        return 'Library sync offline';
+      case LibrarySyncStatus.failed:
+        return 'Library sync failed';
+    }
   }
 
   IconData _statusIcon(WordSyncStatus status) => switch (status) {

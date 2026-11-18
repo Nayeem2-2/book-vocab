@@ -6,10 +6,12 @@ class PageDetailsInput {
   const PageDetailsInput({
     required this.name,
     required this.pageNumber,
+    required this.description,
   });
 
   final String name;
   final int pageNumber;
+  final String description;
 }
 
 /// Dialog for editing a page's independent display name and page number.
@@ -31,6 +33,7 @@ class PageDetailsDialog extends StatefulWidget {
 class _PageDetailsDialogState extends State<PageDetailsDialog> {
   late final TextEditingController _nameController;
   late final TextEditingController _numberController;
+  late final TextEditingController _descriptionController;
 
   @override
   void initState() {
@@ -38,6 +41,8 @@ class _PageDetailsDialogState extends State<PageDetailsDialog> {
     _nameController = TextEditingController(text: widget.page.title);
     _numberController =
         TextEditingController(text: widget.page.pageNumber.toString());
+    _descriptionController =
+        TextEditingController(text: widget.page.description);
     _nameController.addListener(_refreshNumberWarning);
     _numberController.addListener(_refreshNumberWarning);
   }
@@ -48,6 +53,7 @@ class _PageDetailsDialogState extends State<PageDetailsDialog> {
     _nameController.removeListener(_refreshNumberWarning);
     _nameController.dispose();
     _numberController.dispose();
+    _descriptionController.dispose();
     super.dispose();
   }
 
@@ -71,7 +77,11 @@ class _PageDetailsDialogState extends State<PageDetailsDialog> {
     final pageNumber = _parsedNumber;
     if (name.isEmpty || pageNumber == null || pageNumber < 1) return;
     Navigator.of(context).pop(
-      PageDetailsInput(name: name, pageNumber: pageNumber),
+      PageDetailsInput(
+        name: name,
+        pageNumber: pageNumber,
+        description: _descriptionController.text.trim(),
+      ),
     );
   }
 
@@ -112,6 +122,19 @@ class _PageDetailsDialogState extends State<PageDetailsDialog> {
                       : null,
                 ),
                 onSubmitted: (_) => _submit(),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _descriptionController,
+                minLines: 2,
+                maxLines: 5,
+                textCapitalization: TextCapitalization.sentences,
+                decoration: const InputDecoration(
+                  labelText: 'Description',
+                  hintText: 'Add a short note about this page…',
+                  alignLabelWithHint: true,
+                  border: OutlineInputBorder(),
+                ),
               ),
               if (duplicateCount > 0) ...[
                 const SizedBox(height: 9),

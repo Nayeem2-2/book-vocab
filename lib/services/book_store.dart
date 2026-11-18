@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -25,6 +26,9 @@ class BookStore extends ChangeNotifier {
   final Set<String> _known = {};
   final Set<String> _showAgain = {};
   String? _activeAccountUid;
+  String? _activeLibraryUid;
+  final Map<String, int> _libraryTombstones = <String, int>{};
+  int _libraryServerTimeOffsetMs = 0;
   bool _accountWordStatesLoaded = false;
   bool _hasLocalAccountCache = false;
 
@@ -47,6 +51,8 @@ class BookStore extends ChangeNotifier {
   // Word-state updates are intentionally separate from structural store
   // notifications. A single status tap must not rebuild Books/Pages/App bars.
   final ValueNotifier<int> wordStateRevision = ValueNotifier<int>(0);
+  /// Structural/content revision observed by the account library sync service.
+  final ValueNotifier<int> libraryRevision = ValueNotifier<int>(0);
   final Map<String, _WordStateSignal> _wordStateSignals = {};
   static const int _maxWordStateSignals = 512;
   final Map<String, _PracticeScopeCache> _practiceScopeCache = {};
@@ -60,6 +66,17 @@ class BookStore extends ChangeNotifier {
   /// timestamps. Until sync obtains an offset, the device clock is used.
   void setServerTimeOffsetMs(int offset) {
     _serverTimeOffsetMs = offset;
+  }
+
+  void setLibraryServerTimeOffsetMs(int offset) {
+    _libraryServerTimeOffsetMs = offset;
+    final uid = _activeLibraryUid;
+    if (uid != null) {
+      unawaited(_prefs.setInt(
+        'library_server_time_offset_ms_${accountStorageKey(uid)}',
+        offset,
+      ).then<void>((_) {}));
+    }
   }
 
   Future<void> init() async {
@@ -115,6 +132,7 @@ class BookStore extends ChangeNotifier {
               pageRange: '',
               pageNumber: pageNumber,
               isDefaultName: isDefaultName,
+              description: (page['description'] ?? '').toString(),
               imagePath: imagePath,
               words: (page['words'] as List? ?? const [])
                   .map((w) => WordEntry.fromJson(Map<String, dynamic>.from(w)))
@@ -314,6 +332,361 @@ class BookStore extends ChangeNotifier {
     }
     _accountWordStatesLoaded = true;
     return _hasLocalAccountCache;
+  }
+
+  /// Loads only the selected UID's newly account-owned books. Legacy books
+  /// (ownerUid == null) remain device-local and are never uploaded.
+  Future<void> activateLibraryAccount(String uid) async {
+    if (_activeLibraryUid == uid) return;
+    _libraryServerTimeOffsetMs = _prefs.getInt(
+          'library_server_time_offset_ms_${accountStorageKey(uid)}',
+        ) ??
+        0;
+    books.removeWhere((book) => book.ownerUid != null);
+    _libraryTombstones.clear();
+    _activeLibraryUid = uid;
+
+    final root = await _accountLibraryDirectory(uid);
+    final manifest = File('${root.path}/manifest.json');
+    if (await manifest.exists()) {
+      try {
+        final decoded = jsonDecode(await manifest.readAsString());
+        if (decoded is Map) {
+          final tombstones = decoded['tombstones'];
+          if (tombstones is Map) {
+            for (final entry in tombstones.entries) {
+              final stamp = (entry.value as num?)?.toInt();
+              if (stamp != null) _libraryTombstones[entry.key.toString()] = stamp;
+            }
+          }
+          final records = decoded['books'];
+          if (records is List) {
+            for (final rawRecord in records) {
+              if (rawRecord is! Map) continue;
+              final record = Map<String, dynamic>.from(rawRecord);
+              final id = (record['id'] ?? '').toString();
+              if (id.isEmpty) continue;
+              final name = (record['name'] ?? 'Untitled book').toString();
+              final modifiedAt = (record['modifiedAt'] as num?)?.toInt() ?? 0;
+              final type = (record['type'] ?? 'json').toString();
+              try {
+                if (type == 'image') {
+                  final folder = Directory('${root.path}/books/$id');
+                  final metadata = File('${folder.path}/book.json');
+                  if (!await metadata.exists()) continue;
+                  final data = jsonDecode(await metadata.readAsString()) as Map<String, dynamic>;
+                  final pages = <ChapterData>[];
+                  for (final rawPage in (data['pages'] as List? ?? const [])) {
+                    if (rawPage is! Map) continue;
+                    final page = Map<String, dynamic>.from(rawPage);
+                    pages.add(ChapterData(
+                      id: (page['id'] ?? '').toString(),
+                      title: (page['name'] ?? 'Untitled page').toString(),
+                      pageRange: '',
+                      pageNumber: (page['pageNumber'] as num?)?.toInt() ?? 1,
+                      isDefaultName: page['isDefaultName'] == true,
+                      description: (page['description'] ?? '').toString(),
+                      imagePath: page['imagePath']?.toString(),
+                      words: (page['words'] as List? ?? const [])
+                          .whereType<Map>()
+                          .map((word) => WordEntry.fromJson(Map<String, dynamic>.from(word)))
+                          .toList(),
+                    ));
+                  }
+                  books.add(BookData(
+                    id: id,
+                    name: name,
+                    fileName: '',
+                    parts: const [],
+                    jsonPath: metadata.path,
+                    isImageBook: true,
+                    pages: pages,
+                    ownerUid: uid,
+                    modifiedAt: modifiedAt,
+                  ));
+                } else {
+                  final file = File('${root.path}/books/$id.json');
+                  if (!await file.exists()) continue;
+                  final decodedBook = jsonDecode(await file.readAsString());
+                  books.add(BookData(
+                    id: id,
+                    name: name,
+                    fileName: (record['fileName'] ?? 'book.json').toString(),
+                    parts: JsonBookParser.parseParts(decodedBook),
+                    jsonPath: file.path,
+                    ownerUid: uid,
+                    modifiedAt: modifiedAt,
+                  ));
+                }
+              } catch (error) {
+                debugPrint('Could not load account book $id: $error');
+              }
+            }
+          }
+        }
+      } catch (error) {
+        final backup = File('${manifest.path}.corrupt-${DateTime.now().millisecondsSinceEpoch}');
+        await manifest.copy(backup.path);
+        debugPrint('Account library manifest was corrupt and has been backed up: $error');
+      }
+    }
+    _invalidateAllWordCaches();
+    notifyListeners();
+  }
+
+  Future<Directory> _accountLibraryDirectory(String uid) async {
+    final root = await _accountStatesDirectory();
+    final directory = Directory('${root.path}/${accountStorageKey(uid)}/Library');
+    if (!await directory.exists()) await directory.create(recursive: true);
+    return directory;
+  }
+
+  Future<Directory> _booksDirectory({String? uid}) async {
+    if (uid != null) {
+      final library = await _accountLibraryDirectory(uid);
+      final directory = Directory('${library.path}/books');
+      if (!await directory.exists()) await directory.create(recursive: true);
+      return directory;
+    }
+    final root = await getApplicationDocumentsDirectory();
+    final directory = Directory('${root.path}/books');
+    if (!await directory.exists()) await directory.create(recursive: true);
+    return directory;
+  }
+
+  List<BookData> accountBooks(String uid) =>
+      books.where((book) => book.ownerUid == uid).toList(growable: false);
+
+  Map<String, int> get accountLibraryTombstones =>
+      Map<String, int>.unmodifiable(_libraryTombstones);
+
+  int _newLibraryTimestamp() =>
+      DateTime.now().millisecondsSinceEpoch + _libraryServerTimeOffsetMs;
+
+  void _markAccountBookModified(BookData book) {
+    if (book.ownerUid == null) return;
+    final next = _newLibraryTimestamp();
+    book.modifiedAt = next > book.modifiedAt ? next : book.modifiedAt + 1;
+    libraryRevision.value++;
+  }
+
+  void acknowledgeAccountBookSynced(String uid, String bookId, int serverTimestamp) {
+    final book = books.cast<BookData?>().firstWhere(
+      (item) => item?.ownerUid == uid && item?.id == bookId,
+      orElse: () => null,
+    );
+    if (book == null) return;
+    book.modifiedAt = serverTimestamp;
+    unawaited(_saveBookRecords());
+  }
+
+  Future<Map<String, dynamic>> exportAccountBook(BookData book) async {
+    if (book.ownerUid == null || book.ownerUid != _activeLibraryUid) {
+      throw StateError('Only the active account library can be exported.');
+    }
+    if (book.isImageBook) {
+      return {
+        'schemaVersion': 1,
+        'id': book.id,
+        'name': book.name,
+        'type': 'image',
+        'fileName': '',
+        'modifiedAt': book.modifiedAt,
+        // Store the complete ordered page metadata as JSON text. This keeps
+        // empty lists, OCR word arrays and Bangla meanings intact in RTDB,
+        // whose tree model may otherwise represent arrays as numeric-key maps.
+        'pagesJson': jsonEncode(book.pages.map((page) => {
+          'id': page.stableId,
+          'name': page.title,
+          'pageNumber': page.pageNumber,
+          'isDefaultName': page.isDefaultName,
+          'description': page.description,
+          'words': page.words.map((word) => word.toJson()).toList(),
+          // imagePath and image bytes are deliberately excluded.
+        }).toList()),
+      };
+    }
+    final rawContent = await File(book.jsonPath).readAsString();
+    return {
+      'schemaVersion': 1,
+      'id': book.id,
+      'name': book.name,
+      'type': 'json',
+      'fileName': book.fileName,
+      'modifiedAt': book.modifiedAt,
+      'content': rawContent,
+    };
+  }
+
+  Future<void> applyRemoteAccountBook(String uid, Map<String, dynamic> record,
+      {required int serverUpdatedAt}) async {
+    if (_activeLibraryUid != uid) return;
+    final id = (record['id'] ?? '').toString();
+    if (id.isEmpty) return;
+    if (id == '.' || id == '..' || id.contains('/') || id.contains('\\') ||
+        RegExp(r'[\x00-\x1F]').hasMatch(id)) {
+      throw FormatException(
+        'Cloud book ID contains characters that cannot safely be used in a local file path.',
+      );
+    }
+    final type = (record['type'] ?? '').toString();
+    final name = (record['name'] ?? 'Untitled book').toString();
+    final root = await _booksDirectory(uid: uid);
+    final existingIndex = books.indexWhere((book) => book.id == id && book.ownerUid == uid);
+    final existing = existingIndex >= 0 ? books[existingIndex] : null;
+
+    BookData incoming;
+    if (type == 'image') {
+      final folder = Directory('${root.path}/$id');
+      await Directory('${folder.path}/pages').create(recursive: true);
+      final existingPaths = <String, String>{
+        for (final page in existing?.pages ?? const <ChapterData>[])
+          if (page.imagePath != null && page.imagePath!.isNotEmpty && File(page.imagePath!).existsSync())
+            page.stableId: page.imagePath!,
+      };
+      final incomingIds = <String>{};
+      final pages = <ChapterData>[];
+      final rawPagesField = record['pagesJson'];
+      final decodedPages = rawPagesField is String
+          ? jsonDecode(rawPagesField)
+          : record['pages']; // Backward compatibility with the first draft.
+      final rawPages = <dynamic>[];
+      if (decodedPages is List) {
+        rawPages.addAll(decodedPages);
+      } else if (decodedPages is Map) {
+        final entries = decodedPages.entries.toList()
+          ..sort((a, b) {
+            final aIndex = int.tryParse(a.key.toString());
+            final bIndex = int.tryParse(b.key.toString());
+            if (aIndex != null && bIndex != null) return aIndex.compareTo(bIndex);
+            return a.key.toString().compareTo(b.key.toString());
+          });
+        rawPages.addAll(entries.map((entry) => entry.value));
+      } else {
+        throw const FormatException('Cloud image-book page data is missing or malformed.');
+      }
+      for (final rawPage in rawPages) {
+        if (rawPage is! Map) {
+          throw const FormatException('A cloud image-book page record is malformed.');
+        }
+        final page = Map<String, dynamic>.from(rawPage);
+        final pageId = (page['id'] ?? '').toString();
+        if (pageId.isEmpty) {
+          throw const FormatException('A cloud image-book page has no stable ID.');
+        }
+        incomingIds.add(pageId);
+        pages.add(ChapterData(
+          id: pageId,
+          title: (page['name'] ?? 'Untitled page').toString(),
+          pageRange: '',
+          pageNumber: (page['pageNumber'] as num?)?.toInt() ?? 1,
+          isDefaultName: page['isDefaultName'] == true,
+          description: (page['description'] ?? '').toString(),
+          imagePath: existingPaths[pageId],
+          words: (page['words'] as List? ?? const [])
+              .whereType<Map>()
+              .map((word) => WordEntry.fromJson(Map<String, dynamic>.from(word)))
+              .toList(),
+        ));
+      }
+      // Remove local photographs for pages explicitly deleted by a newer cloud record.
+      if (existing != null) {
+        for (final oldPage in existing.pages) {
+          if (!incomingIds.contains(oldPage.stableId) && oldPage.imagePath != null) {
+            await File(oldPage.imagePath!).delete().catchError((_) => File(oldPage.imagePath!));
+          }
+        }
+      }
+      final metadata = File('${folder.path}/book.json');
+      final localData = {
+        'version': 1,
+        'name': name,
+        'pages': pages.map((page) => {
+          'id': page.stableId,
+          'name': page.title,
+          'pageNumber': page.pageNumber,
+          'isDefaultName': page.isDefaultName,
+          'description': page.description,
+          'imagePath': page.imagePath,
+          'words': page.words.map((word) => word.toJson()).toList(),
+        }).toList(),
+      };
+      await metadata.writeAsString(const JsonEncoder.withIndent('  ').convert(localData), flush: true);
+      incoming = BookData(
+        id: id, name: name, fileName: '', parts: const [],
+        jsonPath: metadata.path, isImageBook: true, pages: pages,
+        ownerUid: uid, modifiedAt: serverUpdatedAt,
+      );
+    } else if (type == 'json') {
+      final content = record['content'];
+      if (content is! String) throw const FormatException('Cloud JSON book content is missing.');
+      final decoded = jsonDecode(content);
+      final parts = JsonBookParser.parseParts(decoded);
+      if (parts.isEmpty) throw const FormatException('Cloud JSON book has no chapters.');
+      final file = File('${root.path}/$id.json');
+      await file.writeAsString(content, flush: true);
+      incoming = BookData(
+        id: id, name: name,
+        fileName: (record['fileName'] ?? 'book.json').toString(),
+        parts: parts, jsonPath: file.path, ownerUid: uid,
+        modifiedAt: serverUpdatedAt,
+      );
+    } else {
+      throw FormatException('Unknown cloud book type: $type');
+    }
+
+    if (existingIndex >= 0) {
+      books[existingIndex] = incoming;
+    } else {
+      books.add(incoming);
+    }
+    _libraryTombstones.remove(id);
+    await _saveBookRecords();
+    _invalidateBookWordCache(id);
+    _clearPracticeScopeCaches();
+    notifyListeners();
+  }
+
+  Future<void> removeRemoteAccountBook(String uid, String bookId) async {
+    if (_activeLibraryUid != uid) return;
+    final index = books.indexWhere((book) => book.id == bookId && book.ownerUid == uid);
+    if (index < 0) return;
+    final book = books.removeAt(index);
+    if (book.isImageBook) {
+      final folder = File(book.jsonPath).parent;
+      if (await folder.exists()) await folder.delete(recursive: true);
+    } else {
+      final file = File(book.jsonPath);
+      if (await file.exists()) await file.delete();
+    }
+    await _saveBookRecords();
+    _invalidateBookWordCache(bookId);
+    notifyListeners();
+  }
+
+  Future<void> acknowledgeAccountBookDeleted(String uid, String bookId) async {
+    if (_activeLibraryUid != uid) return;
+    _libraryTombstones.remove(bookId);
+    await _saveBookRecords();
+  }
+
+  Future<void> setLibraryServerModifiedAt(
+    String uid,
+    String bookId,
+    int expectedLocalModifiedAt,
+    int serverTimestamp,
+  ) async {
+    if (_activeLibraryUid != uid) return;
+    BookData? book;
+    for (final candidate in books) {
+      if (candidate.ownerUid == uid && candidate.id == bookId) {
+        book = candidate;
+        break;
+      }
+    }
+    if (book == null || book.modifiedAt != expectedLocalModifiedAt) return;
+    book.modifiedAt = serverTimestamp;
+    await _saveBookRecords();
   }
 
   /// Clears active memory at logout without deleting this account's cache.
@@ -670,12 +1043,6 @@ class BookStore extends ChangeNotifier {
 
   // ── Books ──
 
-  Future<Directory> _booksDirectory() async {
-    final root = await getApplicationDocumentsDirectory();
-    final directory = Directory('${root.path}/books');
-    if (!await directory.exists()) await directory.create(recursive: true);
-    return directory;
-  }
 
   static String normalizeWord(String word) => word.trim().toLowerCase();
 
@@ -1127,7 +1494,8 @@ class BookStore extends ChangeNotifier {
     }
 
     final id = DateTime.now().microsecondsSinceEpoch.toString();
-    final directory = await _booksDirectory();
+    final uid = _activeAccountUid;
+    final directory = await _booksDirectory(uid: uid);
     final path = '${directory.path}/$id.json';
     await File(path).writeAsString(raw);
 
@@ -1138,8 +1506,11 @@ class BookStore extends ChangeNotifier {
       fileName: picked.name,
       parts: parts,
       jsonPath: path,
+      ownerUid: uid,
+      modifiedAt: uid == null ? 0 : _newLibraryTimestamp(),
     );
     books.add(book);
+    if (uid != null) libraryRevision.value++;
     await _saveBookRecords();
     notifyListeners();
     return id;
@@ -1149,11 +1520,13 @@ class BookStore extends ChangeNotifier {
     final clean = name.trim();
     if (clean.isEmpty) throw Exception('Please enter a book name.');
     final id = DateTime.now().microsecondsSinceEpoch.toString();
-    final root = await _booksDirectory();
+    final uid = _activeAccountUid;
+    final root = await _booksDirectory(uid: uid);
     final folder = Directory('${root.path}/$id');
     await Directory('${folder.path}/pages').create(recursive: true);
-    final book = BookData(id: id, name: clean, fileName: '', parts: const [], jsonPath: '${folder.path}/book.json', isImageBook: true, pages: []);
+    final book = BookData(id: id, name: clean, fileName: '', parts: const [], jsonPath: '${folder.path}/book.json', isImageBook: true, pages: [], ownerUid: uid, modifiedAt: uid == null ? 0 : _newLibraryTimestamp());
     books.add(book);
+    if (uid != null) libraryRevision.value++;
     await _saveImageMetadata(book);
     await _saveBookRecords();
     notifyListeners();
@@ -1170,6 +1543,7 @@ class BookStore extends ChangeNotifier {
                 'name': page.title,
                 'pageNumber': page.pageNumber,
                 'isDefaultName': page.isDefaultName,
+                'description': page.description,
                 'imagePath': page.imagePath,
                 'words': page.words.map((word) => word.toJson()).toList(),
               })
@@ -1222,7 +1596,7 @@ class BookStore extends ChangeNotifier {
         imagePath: imagePath,
       ));
       await _saveImageMetadata(book);
-      if (notify) notifyImageBookPagesChanged(book);
+      if (notify) await notifyImageBookPagesChanged(book);
     } catch (_) {
       book.pages.removeWhere((page) => page.stableId == pageId);
       await File(imagePath).delete().catchError((_) => File(imagePath));
@@ -1232,7 +1606,9 @@ class BookStore extends ChangeNotifier {
 
   /// Called once after a multi-image import so the Pages route refreshes once,
   /// not once for every scanned page in the batch.
-  void notifyImageBookPagesChanged(BookData book) {
+  Future<void> notifyImageBookPagesChanged(BookData book) async {
+    _markAccountBookModified(book);
+    await _saveBookRecords();
     _invalidateBookWordCache(book.id);
     _clearPracticeScopeCaches();
     notifyListeners();
@@ -1269,6 +1645,7 @@ class BookStore extends ChangeNotifier {
     }
     if (current == null) return;
     current.name = clean;
+    _markAccountBookModified(current);
     if (current.isImageBook) await _saveImageMetadata(current);
     await _saveBookRecords();
     notifyListeners();
@@ -1280,6 +1657,7 @@ class BookStore extends ChangeNotifier {
       page,
       name: name,
       pageNumber: page.pageNumber,
+      description: page.description,
     );
   }
 
@@ -1291,6 +1669,7 @@ class BookStore extends ChangeNotifier {
     ChapterData page, {
     required String name,
     required int pageNumber,
+    String description = '',
   }) async {
     final clean = name.trim();
     if (clean.isEmpty) throw Exception('Page name cannot be empty.');
@@ -1321,10 +1700,13 @@ class BookStore extends ChangeNotifier {
     // sets continue to refer to the same scanned page.
     current.title = uniqueName;
     current.pageNumber = pageNumber;
+    current.description = description.trim();
     current.isDefaultName = current.isDefaultName && nameUnchanged && numberChanged
         ? true
         : defaultNameMatch;
+    _markAccountBookModified(book);
     await _saveImageMetadata(book);
+    await _saveBookRecords();
     notifyListeners();
   }
 
@@ -1342,14 +1724,18 @@ class BookStore extends ChangeNotifier {
     if (removed.isEmpty) return;
 
     book.pages.removeWhere((page) => targetIds.contains(page.stableId));
+    _markAccountBookModified(book);
+    // Persist the page removal and account manifest before deleting local image
+    // files. If the app closes mid-operation, the page cannot be resurrected
+    // from stale metadata; at worst an unreferenced image file remains.
+    await _saveImageMetadata(book);
+    await _saveBookRecords();
     for (final page in removed) {
       final imagePath = page.imagePath;
       if (imagePath == null || imagePath.isEmpty) continue;
       final file = File(imagePath);
       if (await file.exists()) await file.delete();
     }
-
-    await _saveImageMetadata(book);
     _invalidateBookWordCache(book.id);
     _clearPracticeScopeCaches();
     notifyListeners();
@@ -1366,7 +1752,16 @@ class BookStore extends ChangeNotifier {
     final removed = books.where((book) => targetIds.contains(book.id)).toList();
     if (removed.isEmpty) return;
 
+    for (final book in removed) {
+      if (book.ownerUid != null && book.ownerUid == _activeLibraryUid) {
+        _libraryTombstones[book.id] = _newLibraryTimestamp();
+        libraryRevision.value++;
+      }
+    }
     books.removeWhere((book) => targetIds.contains(book.id));
+    // Persist account tombstones before removing local files. This ensures an
+    // offline deletion survives an app shutdown during file cleanup.
+    await _saveBookRecords();
     for (final book in removed) {
       _invalidateBookWordCache(book.id);
       _clearPracticeScopeCaches();
@@ -1381,25 +1776,40 @@ class BookStore extends ChangeNotifier {
       await _prefs.remove('states_${book.id}');
     }
 
-    await _saveBookRecords();
     notifyListeners();
   }
 
   Future<void> _saveBookRecords() async {
-    final records = books
-        .map((b) => jsonEncode({
-              'id': b.id,
-              'name': b.name,
-              'fileName': b.fileName,
-              'type': b.isImageBook ? 'image' : 'json',
-            }))
-        .toList();
+    // Keep pre-account books in their original device-local SharedPreferences
+    // index. New books are stored only in the active UID's library directory.
+    final records = books.where((book) => book.ownerUid == null).map((b) =>
+        jsonEncode({'id': b.id, 'name': b.name, 'fileName': b.fileName,
+          'type': b.isImageBook ? 'image' : 'json'})).toList();
     await _prefs.setStringList('book_records', records);
+
+    final uid = _activeLibraryUid;
+    if (uid != null) {
+      final root = await _accountLibraryDirectory(uid);
+      final accountRecords = books.where((book) => book.ownerUid == uid).map((book) => {
+        'id': book.id,
+        'name': book.name,
+        'fileName': book.fileName,
+        'type': book.isImageBook ? 'image' : 'json',
+        'modifiedAt': book.modifiedAt,
+      }).toList();
+      final manifest = File('${root.path}/manifest.json');
+      await manifest.writeAsString(const JsonEncoder.withIndent('  ').convert({
+        'version': 1,
+        'books': accountRecords,
+        'tombstones': _libraryTombstones,
+      }), flush: true);
+    }
   }
   @override
   void dispose() {
     wordStatesReady.dispose();
     wordStateRevision.dispose();
+    libraryRevision.dispose();
     for (final signal in _wordStateSignals.values.toList()) {
       signal.dispose();
     }

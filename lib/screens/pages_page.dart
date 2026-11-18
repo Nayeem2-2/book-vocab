@@ -1,15 +1,18 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:indexed_sliver_list/indexed_sliver_list.dart';
 
 import '../models/book_models.dart';
 import '../services/book_store.dart';
+import '../services/view_preferences_service.dart';
 import '../services/image_page_importer.dart';
-import '../widgets/alphabet_fast_scroller.dart';
 import '../widgets/page_details_dialog.dart';
+import '../widgets/alphabet_fast_scroller.dart';
 import '../widgets/page_number_fast_scroller.dart';
 import '../widgets/play_widgets.dart';
+import '../widgets/view_settings_sheet.dart';
 import 'chapter_page.dart';
 
 class PagesPage extends StatefulWidget {
@@ -34,6 +37,10 @@ class _PagesPageState extends State<PagesPage> {
   int? _pendingPageJump;
   int _pageJumpTicket = 0;
   bool _pageJumpScheduled = false;
+  BrowseLayout _viewLayout = BrowseLayout.list;
+  int _listSize = 3;
+  int _gridSize = 3;
+  int get _viewSize => _viewLayout == BrowseLayout.list ? _listSize : _gridSize;
 
   bool get _selectionMode => _selectedPageIds.isNotEmpty;
 
@@ -41,6 +48,7 @@ class _PagesPageState extends State<PagesPage> {
   void initState() {
     super.initState();
     widget.store.addListener(_onStoreStructureChanged);
+    _loadViewPreferences();
   }
 
   @override
@@ -177,6 +185,7 @@ class _PagesPageState extends State<PagesPage> {
         page,
         name: details.name,
         pageNumber: details.pageNumber,
+        description: details.description,
       );
       if (!mounted) return;
       _cachedListData = null;
@@ -350,13 +359,13 @@ class _PagesPageState extends State<PagesPage> {
           ? numberMatches
           : rankAndSortByName<ChapterData>(
               orderedPages,
-              (page) => page.title,
+              (page) => '${page.title} ${page.description}',
               normalizedQuery,
             );
     } else {
       visiblePages = rankAndSortByName<ChapterData>(
         orderedPages,
-        (page) => page.title,
+        (page) => '${page.title} ${page.description}',
         normalizedQuery,
       );
     }
@@ -373,10 +382,127 @@ class _PagesPageState extends State<PagesPage> {
     return data;
   }
 
+  Future<void> _loadViewPreferences() async {
+    final preference = await ViewPreferencesService.load('pages');
+    if (!mounted) return;
+    setState(() {
+      _viewLayout = preference.layout;
+      _listSize = preference.listSize;
+      _gridSize = preference.gridSize;
+    });
+  }
+
+  void _updateViewPreference(BrowseViewPreference preference) {
+    setState(() {
+      _viewLayout = preference.layout;
+      _listSize = preference.listSize;
+      _gridSize = preference.gridSize;
+      _cachedListData = null;
+    });
+    unawaited(ViewPreferencesService.save('pages', preference));
+  }
+
+  Future<void> _openViewSettings() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: false,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+      ),
+      builder: (_) => ViewSettingsSheet(
+        preference: BrowseViewPreference(
+          layout: _viewLayout, listSize: _listSize, gridSize: _gridSize,
+        ),
+        description: 'Customize how your scanned pages are displayed.',
+        onChanged: _updateViewPreference,
+        previewBuilder: _pageSettingsPreview,
+      ),
+    );
+  }
+
+  Widget _pageSettingsPreview(BrowseViewPreference preference) {
+    final page = widget.book.pages.isNotEmpty
+        ? widget.book.pages.first
+        : ChapterData(title: 'Sample page', pageRange: '', words: const [], pageNumber: 1,
+            description: 'A short page description appears here.');
+    if (preference.layout == BrowseLayout.list) {
+      return Card(
+        margin: EdgeInsets.zero,
+        child: Padding(
+          padding: EdgeInsets.all(8 + preference.size.toDouble()),
+          child: Row(
+            children: [
+              Container(
+                width: (40 + preference.size * 2).toDouble(),
+                height: (40 + preference.size * 2).toDouble(),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(11),
+                ),
+                child: Text('${page.pageNumber}',
+                    style: const TextStyle(fontWeight: FontWeight.w800)),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(page.title, style: const TextStyle(fontWeight: FontWeight.w700)),
+                    Text(page.description.isEmpty ? 'Page description' : page.description,
+                        maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodySmall),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: EdgeInsets.all(8 + preference.size.toDouble()),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              CircleAvatar(radius: 13, child: Text('${page.pageNumber}',
+                  style: const TextStyle(fontSize: 11))),
+              const Spacer(),
+              const Icon(Icons.more_horiz, size: 18),
+            ]),
+            const SizedBox(height: 8),
+            Container(
+              height: (44 + preference.size * 3).toDouble(),
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: const Icon(Icons.image_outlined),
+            ),
+            const SizedBox(height: 8),
+            Text(page.title, maxLines: 1, overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w700)),
+            Text(page.description.isEmpty ? 'Page description' : page.description,
+                maxLines: 2, overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.bodySmall),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _pageTile(ChapterData page, List<ChapterData> orderedPages) {
     final selected = _selectedPageIds.contains(page.stableId);
+    final height = 88.0 + (_viewSize * 12.0);
     return SizedBox(
-      height: 88,
+      height: height,
       child: Card(
         margin: const EdgeInsets.symmetric(vertical: 4),
         clipBehavior: Clip.antiAlias,
@@ -384,42 +510,46 @@ class _PagesPageState extends State<PagesPage> {
           onTap: () => _openPage(page, orderedPages),
           onLongPress: () => _togglePageSelection(page),
           child: ListTile(
-            dense: true,
-            contentPadding: const EdgeInsets.fromLTRB(12, 5, 8, 5),
-            leading: _selectionMode
-                ? Icon(
-                    selected ? Icons.check_circle : Icons.radio_button_unchecked,
-                    color: selected ? Theme.of(context).colorScheme.primary : Colors.black38,
-                    size: 27,
-                  )
-                : Container(
-                    width: 48,
-                    height: 48,
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFE8F1EC),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Text(
-                      '${page.pageNumber}',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Color(0xFF356859),
-                        fontSize: 17,
-                        fontWeight: FontWeight.w900,
-                      ),
-                    ),
-                  ),
+            dense: _viewSize <= 2,
+            contentPadding: EdgeInsets.fromLTRB(12, 4, 5, 4 + _viewSize.toDouble()),
+            leading: Container(
+              width: (44 + _viewSize * 2).toDouble(),
+              height: (44 + _viewSize * 2).toDouble(),
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.primaryContainer,
+                borderRadius: BorderRadius.circular(11),
+              ),
+              child: Text(
+                '${page.pageNumber}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onPrimaryContainer,
+                  fontSize: 15 + _viewSize.toDouble() * 0.4,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ),
             title: Text(
               page.title,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontWeight: FontWeight.w700),
+              style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14 + _viewSize * 0.35),
             ),
-            subtitle: Text('Page number ${page.pageNumber}  •  ${page.words.length} distinct words'),
+            subtitle: Text(
+              page.description.trim().isNotEmpty
+                  ? page.description.trim()
+                  : '${page.words.length} vocabulary words',
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
             trailing: _selectionMode
-                ? const SizedBox(width: 4)
+                ? Icon(
+                    selected ? Icons.check_circle : Icons.radio_button_unchecked,
+                    color: selected ? Theme.of(context).colorScheme.primary : Colors.black38,
+                    size: 25,
+                  )
                 : Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -429,34 +559,110 @@ class _PagesPageState extends State<PagesPage> {
                         chapters: [page],
                         size: 30,
                       ),
-                      PopupMenuButton<String>(
-                        tooltip: 'Page options',
-                        onSelected: (value) {
-                          if (value == 'edit') _editPageDetails(page);
-                          if (value == 'delete') _confirmDeletePages([page]);
-                        },
-                        itemBuilder: (_) => const [
-                          PopupMenuItem(
-                            value: 'edit',
-                            child: ListTile(
-                              contentPadding: EdgeInsets.zero,
-                              leading: Icon(Icons.edit_outlined),
-                              title: Text('Edit name & number'),
-                            ),
-                          ),
-                          PopupMenuItem(
-                            value: 'delete',
-                            child: ListTile(
-                              contentPadding: EdgeInsets.zero,
-                              leading: Icon(Icons.delete_outline),
-                              title: Text('Delete'),
-                            ),
-                          ),
-                        ],
-                      ),
+                      _pageOptionsMenu(page),
                     ],
                   ),
           ),
+        ),
+      ),
+    );
+  }
+
+  PopupMenuButton<String> _pageOptionsMenu(ChapterData page) =>
+      PopupMenuButton<String>(
+        tooltip: 'Page options',
+        onSelected: (value) {
+          if (value == 'edit') _editPageDetails(page);
+          if (value == 'delete') _confirmDeletePages([page]);
+        },
+        itemBuilder: (_) => const [
+          PopupMenuItem(
+            value: 'edit',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.edit_outlined),
+              title: Text('Edit page details'),
+            ),
+          ),
+          PopupMenuItem(
+            value: 'delete',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.delete_outline),
+              title: Text('Delete'),
+            ),
+          ),
+        ],
+      );
+
+  Widget _pageGridTile(ChapterData page, List<ChapterData> orderedPages) {
+    final selected = _selectedPageIds.contains(page.stableId);
+    final imagePath = page.imagePath;
+    final hasImage = imagePath != null && imagePath.isNotEmpty && File(imagePath).existsSync();
+    return Card(
+      margin: EdgeInsets.zero,
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: () => _openPage(page, orderedPages),
+        onLongPress: () => _togglePageSelection(page),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 8, 4, 6),
+              child: Row(
+                children: [
+                  CircleAvatar(
+                    radius: 13,
+                    backgroundColor: Theme.of(context).colorScheme.primaryContainer,
+                    foregroundColor: Theme.of(context).colorScheme.onPrimaryContainer,
+                    child: FittedBox(child: Text('${page.pageNumber}',
+                        style: const TextStyle(fontWeight: FontWeight.w800))),
+                  ),
+                  const Spacer(),
+                  if (_selectionMode)
+                    Icon(selected ? Icons.check_circle : Icons.radio_button_unchecked,
+                        size: 21, color: selected ? Theme.of(context).colorScheme.primary : null)
+                  else
+                    _pageOptionsMenu(page),
+                ],
+              ),
+            ),
+            Expanded(
+              child: Container(
+                width: double.infinity,
+                margin: const EdgeInsets.symmetric(horizontal: 9),
+                clipBehavior: Clip.antiAlias,
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: hasImage
+                    ? Image.file(File(imagePath), fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => const Center(child: Icon(Icons.image_not_supported_outlined)))
+                    : const Center(child: Icon(Icons.image_outlined, size: 34)),
+              ),
+            ),
+            Padding(
+              padding: EdgeInsets.fromLTRB(11, 9, 11, 9 + _viewSize.toDouble()),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(page.title, maxLines: 1, overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13 + _viewSize * 0.3)),
+                  const SizedBox(height: 3),
+                  Text(
+                    page.description.trim().isNotEmpty
+                        ? page.description.trim()
+                        : '${page.words.length} vocabulary words',
+                    maxLines: _viewSize >= 4 ? 3 : 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -542,7 +748,25 @@ class _PagesPageState extends State<PagesPage> {
                     ),
                     const SizedBox(width: 6),
                   ]
-                : [],
+                : [
+                    PopupMenuButton<String>(
+                      tooltip: 'More options',
+                      icon: const Icon(Icons.more_vert),
+                      onSelected: (value) {
+                        if (value == 'view') _openViewSettings();
+                      },
+                      itemBuilder: (_) => const [
+                        PopupMenuItem(
+                          value: 'view',
+                          child: ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: Icon(Icons.dashboard_customize_outlined),
+                            title: Text('View options'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
           ),
           floatingActionButton: _selectionMode
               ? null
@@ -621,37 +845,52 @@ class _PagesPageState extends State<PagesPage> {
                               ),
                             ),
                           )
-                        : Stack(
-                            children: [
-                              Positioned.fill(
-                                child: IndexedListView(
-                                  key: ValueKey('page-list:${widget.book.id}:${visiblePages.length}:${_query}:$_listControllerGeneration'),
-                                  controller: _scrollController,
-                                  padding: const EdgeInsets.fromLTRB(12, 0, 42, 100),
-                                  itemCount: visiblePages.length,
-                                  estimatedItemExtent: 88,
-                                  addAutomaticKeepAlives: false,
-                                  itemBuilder: (context, index) => _pageTile(
-                                    visiblePages[index],
-                                    orderedPages,
-                                  ),
+                        : _viewLayout == BrowseLayout.grid
+                            ? GridView.builder(
+                                key: ValueKey('page-grid:${widget.book.id}:${visiblePages.length}:${_query}'),
+                                padding: const EdgeInsets.fromLTRB(12, 0, 12, 100),
+                                itemCount: visiblePages.length,
+                                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                                  crossAxisCount: _viewSize == 1 ? 3 : (_viewSize == 5 ? 1 : 2),
+                                  crossAxisSpacing: 10,
+                                  mainAxisSpacing: 10,
+                                  mainAxisExtent: 190.0 + (_viewSize * 18.0),
                                 ),
+                                itemBuilder: (context, index) => _pageGridTile(
+                                  visiblePages[index], orderedPages,
+                                ),
+                              )
+                            : Stack(
+                                children: [
+                                  Positioned.fill(
+                                    child: IndexedListView(
+                                      key: ValueKey('page-list:${widget.book.id}:${visiblePages.length}:${_query}:$_listControllerGeneration'),
+                                      controller: _scrollController,
+                                      padding: const EdgeInsets.fromLTRB(12, 0, 42, 100),
+                                      itemCount: visiblePages.length,
+                                      estimatedItemExtent: 100.0 + (_viewSize * 12.0),
+                                      addAutomaticKeepAlives: false,
+                                      itemBuilder: (context, index) => _pageTile(
+                                        visiblePages[index],
+                                        orderedPages,
+                                      ),
+                                    ),
+                                  ),
+                                  if (!_selectionMode && visiblePages.length > 1)
+                                    Positioned(
+                                      right: 1,
+                                      top: 8,
+                                      bottom: 104,
+                                      child: PageNumberFastScroller(
+                                        controller: _scrollController,
+                                        itemCount: visiblePages.length,
+                                        pageNumbers: listData.visiblePageNumbers,
+                                        onIndexChanged: _queuePageListJump,
+                                        onDragEnd: _settlePageListJump,
+                                      ),
+                                    ),
+                                ],
                               ),
-                              if (!_selectionMode && visiblePages.length > 1)
-                                Positioned(
-                                  right: 1,
-                                  top: 8,
-                                  bottom: 104,
-                                  child: PageNumberFastScroller(
-                                    controller: _scrollController,
-                                    itemCount: visiblePages.length,
-                                    pageNumbers: listData.visiblePageNumbers,
-                                    onIndexChanged: _queuePageListJump,
-                                    onDragEnd: _settlePageListJump,
-                                  ),
-                                ),
-                            ],
-                          ),
               ),
             ],
           ),

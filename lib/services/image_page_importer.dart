@@ -89,7 +89,7 @@ Future<List<ChapterData>> addImagePagesFromSource({
     final hasAddedPages = book.pages.any(
       (page) => !existingIds.contains(page.stableId),
     );
-    if (hasAddedPages) store.notifyImageBookPagesChanged(book);
+    if (hasAddedPages) await store.notifyImageBookPagesChanged(book);
   }
 
   return book.pages
